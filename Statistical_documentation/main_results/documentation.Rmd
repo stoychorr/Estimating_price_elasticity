@@ -1681,7 +1681,7 @@ write.xlsx(
 
 ```{r}
 h <- hist(
-  eu_control$GDP,
+  eu_control$GDPpc,
   breaks = "FD",
   freq = FALSE,
   right = FALSE,

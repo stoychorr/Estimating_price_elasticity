@@ -10,18 +10,19 @@ output:
 
 # Prepare the dataset
 
-This chunk loads the main dataset and prepares the analysis sample. First, the Excel file containing the full applicant dataset is imported (it is also pre-filtered). Non-comparable territories and aggregate categories are removed to ensure that only consistent country units remain. Two country groups are then defined: EU member states (`eu_real`), which represent the treated group, and a synthetic comparison set (`eu_synth`) used as the control pool. The dataset is restricted to observations belonging to these two groups and to years after 2015. Finally, indicator variables are created to identify whether each observation belongs to the real EU group or the synthetic comparison group, and a categorical grouping variable is constructed for convenience. Basic checks (unique countries, group counts, and data preview) are printed to verify the resulting sample.
+This chunk loads the main data set and prepares the analysis sample. First, the Excel file containing the full applicant data set is imported (it is also pre-filtered). Non-comparable territories and aggregate categories are removed to ensure that only consistent country units remain. Two country groups are then defined: EU member states (`eu_real`), which represent the treated group, and a synthetic comparison set (`eu_synth`) used as the control pool. The data set is restricted to observations belonging to these two groups and to years after 2015. Finally, indicator variables are created to identify whether each observation belongs to the real EU group or the synthetic comparison group, and a categorical grouping variable is constructed for convenience. Basic checks (unique countries, group counts, and data preview) are printed to verify the resulting sample.
 
 ```{r}
 library(readxl)
 library(dplyr)
 
-data <- read_excel(
+# we will pull the data only once and then reference it if necessary 
+data_full <- read_excel(
   "data_filtered.xlsx", 
   sheet = "full_data"
 )
 
-data <- data %>%
+data_full <- data_full %>%
   filter(!Domicile_named_country %in% c(
     "St Barthelemy", "St Martin (French part)", "Reunion",
     "Martinique", "Guadeloupe", "Aland Islands",
@@ -40,11 +41,11 @@ eu_real <- c(
 )
 eu_synth <- c("Australia", "Saudi Arabia", "Russian Federation", "Peru", "Kuwait", "Bahrain","Singapore","Switzerland", "Hong Kong", "United States of America",  "Thailand", "Canada", "Mauritius", "Qatar", "Norway", "Israel", "Malaysia", "Jordan", "Albania", "Serbia", "Ireland", "Jersey", "Macao","United Arab Emirates", "Vietnam [Viet Nam]", "Turkey")
 
-
-data <- data %>%
+# Now create a filtered copy of the database to use in the regressions
+data_UCAS  <- data_full %>%
   filter(Domicile_named_country %in% c(eu_real, eu_synth))
 
-data_UCAS <- data %>%
+data_UCAS <- data_UCAS %>%
   mutate(
     real_EU  = ifelse(Domicile_named_country %in% eu_real, 1, 0),
     synth_EU = ifelse(Domicile_named_country %in% eu_synth, 1, 0),
@@ -55,34 +56,29 @@ data_UCAS <- data %>%
     )
   )
 
-print(unique(data$Domicile_named_country))
-table(data$EU_group)
+print(unique(data_UCAS$Domicile_named_country))
+table(data_UCAS$EU_group)
 
-head(data)
+head(data_UCAS)
 
 ```
 
 Next we perform a sanity check:
 
 ```{r}
-data <- data %>%
+data_UCAS <- data_UCAS %>%
   mutate(
     EU_group = case_when(
       Domicile_named_country %in% eu_real  ~ "Real_EU",
       Domicile_named_country %in% eu_synth ~ "Synthetic_EU"
     )
   )
-table(data$EU_group)
+table(data_UCAS$EU_group)
 ```
 
-260/10 = 26 real European countries (excl. Ireland because it didn't face the same restrictions (-1) and excluding UK for obvious reasons (-1)) and 260/10=26 synthetic countries (including Ireland because it is the most plausible counterfactual)
+260/10 = 26 real European countries (excl. Ireland because it didn't face the same restrictions (-1) and excluding UK for obvious reasons (-1)) and 260/10=26 synthetic countries (including Ireland because it is the most plausible counter-factual)
 
-```{r}
-library(plm)
 
-pdata_UCAS <- pdata.frame(data, index = c("Domicile_named_country", "Year"))
-
-```
 
 # Saturated DID
 
@@ -108,8 +104,8 @@ Each coefficient $\beta_c$ captures the post-Brexit change in applications for t
 ```{r}
 library(fixest)
 
-# clean data 
-df <- as.data.frame(pdata_UCAS)
+# make a copy of the original UCAS database to use in the following regressions
+df <- data_UCAS
 df$Domicile_named_country <- as.character(df$Domicile_named_country)
 df$Year <- as.integer(as.character(df$Year))
 
@@ -168,10 +164,12 @@ where $\beta_{\ell}$ traces the dynamic EU–control difference in year $\ell$ r
 ```{r}
 library(fixest)
 
-df$Domicile_named_country <- as.character(df$Domicile_named_country)
+# to perform the following chunks transform Year to numeric
+
 df$Year <- as.integer(as.character(df$Year))
 
 # treatment definition 
+
 df$Post    <- as.integer(df$Year >= 2021)
 df$EU      <- as.integer(df$Domicile_named_country %in% eu_real)
 
@@ -202,6 +200,7 @@ iplot(
 ```
 
 ```{r}
+# Quick Wald test to insure robustness
 wald(m_event, c(
 "event_time::-4:EU",
 "event_time::-3:EU",
@@ -216,7 +215,7 @@ Interestingly, if we remove the clustering the following happens:
 etable(m_event, vcov="iid")
 ```
 
-(notice that ths standard errors are equal everywhere). Under iid (homoskedastic) errors, the event-time dummies will have the same variance in this design, and therefore identical standard errors. That follows directly from the mechanics of OLS. With iid errors, the variance of each coefficient depends only on
+notice that the standard errors are equal everywhere. Under iid (homoskedastic) errors, the event-time dummies will have the same variance in this design, and therefore identical standard errors. That follows directly from the mechanics of OLS. With iid errors, the variance of each coefficient depends only on
 
 $$
 Var(\hat{\delta}_l)=\sigma^2(X_l'X_l'^{-1})
@@ -228,11 +227,12 @@ and the second moment of the regressor, and since each event-time dummy has iden
 etable(m_event, vcov="hetero")
 ```
 
-Thats generally because of the sandwich estimator that identifies the SEs in robust se design:
+That's generally because of the sandwich estimator that identifies the SEs in robust SE design:
 
 $$
 Vcov(\beta)=(X'X)^{-1}X'\Omega X(X'X)^{-1}
 $$ where the $\Omega =\diag(\varepsilon_it^2)$ which is going to create some variance so chill.
+
 
 ### Placebo graph
 
@@ -250,6 +250,7 @@ where the coefficients $\beta_{\ell}$ capture placebo EU–control differences r
 
 ```{r}
 #placebo event time (fake Brexit in 2018)
+
 df$event_time_pl2018 <- df$Year - 2018
 
 m_placebo_2018 <- feols(
@@ -275,6 +276,7 @@ iplot(
 
 ```{r}
 # leads-only sample (pre-2021 only) 
+
 df_pre <- subset(df, Year < 2021)
 
 df_pre$event_time <- df_pre$Year - 2020
@@ -310,87 +312,89 @@ wald(m_leads_only, c(
 
 ### Randomized treatment assignment {#sec-randomized-treatment-assignment}
 
+First we need to prepare the database: 
+
 ```{r}
 set.seed(123)
 
-# Since now we need the entire sample we will pull the data again
-data <- read_excel(
-  "data_filtered.xlsx",
-  sheet = "full_data"
-)
+# Since now we need the entire sample we will make a copy of the data_full here:
 
-# drop unwanted territories
-data <- data %>%
-  filter(!Domicile_named_country %in% c(
-    "St Barthelemy", "St Martin (French part)", "Reunion",
-    "Martinique", "Guadeloupe", "Aland Islands",
-    "Cyprus (Not otherwise specified)",
-    "French West Indies (Not In Use)",
-    "Canary Islands", "French Guiana"
-  ))
+rand_treat_data<- data_full
 
-# keep only observations with complete data for variables used in the model
-data <- data %>%
-  filter(
-    !is.na(Domicile_named_country),
-    !is.na(Year),
-    !is.na(Applicants)
-  )
+# Here we will only keep countries with complete panels over the observed year range
 
-# keep only countries with complete panel over the observed year range
+years_needed <- sort(unique(rand_treat_data$Year))
 
-years_needed <- sort(unique(data$Year))
-
-complete_countries <- data %>%
+complete_countries <- rand_treat_data %>%
   distinct(Domicile_named_country, Year) %>%
   count(Domicile_named_country, name = "n_years") %>%
   filter(n_years == length(years_needed)) %>%
   pull(Domicile_named_country)
 
-data <- data %>%
+rand_treat_data <- rand_treat_data %>%
   filter(Domicile_named_country %in% complete_countries)
 
-data<-data%>% filter(Domicile_named_country!="All")
+rand_treat_data<-rand_treat_data%>% filter(Domicile_named_country!="All")
 
-# define placebo control pool: only non-EU countries remaining in the cleaned sample
-control_pool <- setdiff(unique(data$Domicile_named_country), eu_real)
+```
+
+Next we design the placebo control pool. 
+
+```{r}
+# define placebo control pool: only non-EU countries remaining in the cleaned sample. The set-diff operator creates the control pool by subtracting the non-EU observations from all the unique obs in the database
+
+control_pool <- setdiff(unique(rand_treat_data$Domicile_named_country), eu_real)
 
 # sample placebo-treated countries from non-EU pool
 fake_EU <- sample(control_pool, length(eu_real), replace = FALSE)
 
 # assign placebo treatment and event time
-data <- data %>%
+rand_treat_data <- rand_treat_data %>%
   mutate(
     EU_placebo = as.integer(Domicile_named_country %in% fake_EU),
     event_time = Year - 2020
   )
+```
 
+```{r Full_random_group}
 # print placebo assignment table
 
 assignment_table <- data.frame(
-  country = sort(unique(data$Domicile_named_country))
+  
+  country = sort(unique(rand_treat_data$Domicile_named_country))
+  
 ) %>%
+  
   mutate(
+    
     group = ifelse(country %in% fake_EU, "Placebo treated", "Control")
+    
   ) %>%
+  
   arrange(desc(group), country)
 
 print(assignment_table)
 
 # counts by group
+
 print(table(assignment_table$group))
 
+```
+
+```{r Random_REG}
 # estimate model
 m_placebo_random <- feols(
   log(Applicants) ~ i(event_time, EU_placebo, ref = 0) |
     Domicile_named_country + Year,
-  data = data,
+  data = rand_treat_data,
   panel.id = ~ Domicile_named_country + Year,
   cluster = ~ Domicile_named_country
 )
 
 summary(m_placebo_random)
+```
 
+```{r}
 iplot(
   m_placebo_random,
   xlab = "Years relative to 2020",
@@ -398,7 +402,59 @@ iplot(
   ref.line = 0,
   main = "Placebo with randomized treatment assignment"
 )
+```
+Next we will perform the placebo assignment with only the data that has the entire eu real excluded 
 
+```{r}
+rand_treat_data<-rand_treat_data[rand_treat_data$Domicile_named_country %in% control_pool, ]
+```
+
+```{r}
+# print placebo assignment table
+
+assignment_table <- data.frame(
+  
+  country = sort(unique(rand_treat_data$Domicile_named_country))
+  
+) %>%
+  
+  mutate(
+    
+    group = ifelse(country %in% fake_EU, "Placebo treated", "Control")
+    
+  ) %>%
+  
+  arrange(desc(group), country)
+
+print(assignment_table)
+
+# counts by group
+
+print(table(assignment_table$group))
+
+```
+from @{Full_random_group} we know that the total number of non-eu countries is  157. Therefore  157-131=26. And we repeat the regression from @{r Random_REG}:
+
+```{r}
+m_placebo_random2 <- feols(
+  log(Applicants) ~ i(event_time, EU_placebo, ref = 0) |
+    Domicile_named_country + Year,
+  data = rand_treat_data,
+  panel.id = ~ Domicile_named_country + Year,
+  cluster = ~ Domicile_named_country
+)
+
+summary(m_placebo_random2)
+```
+
+```{r}
+iplot(
+  m_placebo_random2,
+  xlab = "Years relative to 2020",
+  ylab = "Log difference in applications",
+  ref.line = 0,
+  main = "Placebo with randomized treatment assignment"
+)
 ```
 
 ## Saturated event study {#sec-saturated-event-study}
@@ -406,7 +462,8 @@ iplot(
 ```{r}
 library(fixest)
 
-df <- as.data.frame(pdata_UCAS)
+#make a copy of the base dataset for UCAS
+df <- data_UCAS
 
 # make sure these are plain base variables
 
@@ -536,7 +593,7 @@ fee_df <- df %>%
   ) %>%
   rename(country = Domicile_named_country)
 
-# 4. Merge datasets
+# 4. Merge data sets
 
 plot_df <- did_df %>%
   left_join(fee_df, by = "country") %>%
@@ -915,41 +972,6 @@ print(ATE_table)
 
 ```
 
-## TWFE DIDs for different control groups
-
-```{r}
-
-ATE_table <- ATE_table[
-  match(
-    c("Very poor controls",
-      "Original synthetic",
-      "Very rich controls",
-      "OECD controls"),
-    ATE_table$Spec
-  ),
-]
-
-# sanity check
-stopifnot(!any(is.na(ATE_table$Spec)))
-
-# ---- confidence intervals ----
-ATE_table$lower <- ATE_table$ATE - 1.96 * ATE_table$SE
-ATE_table$upper <- ATE_table$ATE + 1.96 * ATE_table$SE
-
-# ---- numeric y positions ----
-y_pos <- seq_len(nrow(ATE_table))
-
-library(ggplot2)
-
-ggplot(ATE_table, aes(x = ATE, y = Spec)) +
-  geom_point() +
-  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
-  geom_vline(xintercept = 0, linetype = "dashed") +
-  xlab("ATE (log points)") +
-  ylab("")
-
-```
-
 ## Bootstrapped ATE
 
 ```{r}
@@ -1016,16 +1038,6 @@ hist(
 abline(v = 0, lty = 2)
 abline(v = mean(boot_ATE_clean), col = "red")
 
-
-#Option 2
-lattice::densityplot(
-  ~ boot_ATE_clean,
-  plot.points = FALSE,
-  auto.key = list(columns = 2),
-  lwd = 2, 
-  xlab = "EU × Post coefficient",
-  main = "Stratified cluster bootstrap: Brexit ATE"
-)
 
 ```
 
@@ -1187,7 +1199,7 @@ summary(summary(sensemakr(m, treatment = "EU:Post_2021")))
 ```
 
 ```{r}
-ovb_minimal_reporting(s, format = "latex")
+ovb_minimal_reporting(s)
 ```
 
 # ATE wealth heterogeneity {#sec-ate-wealth-heterogeneity}
@@ -1195,65 +1207,21 @@ ovb_minimal_reporting(s, format = "latex")
 ## Constructing the database {#sec-constructing-the-database}
 
 ```{r}
-
-rm(list = ls())            # remove all objects
-gc()                       # garbage collection
-```
-
-```{r}
-data <- read_excel(
-  "data_filtered.xlsx", 
-  sheet = "full_data"
-)
-
-data <- data %>%
-  filter(!Domicile_named_country %in% c(
-    "St Barthelemy", "St Martin (French part)", "Reunion",
-    "Martinique", "Guadeloupe", "Aland Islands",
-    "Cyprus (Not otherwise specified)",
-    "French West Indies (Not In Use)",
-    "Canary Islands", "French Guiana"
-  ))
-
-eu_real <- c(
-  "Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus (European Union)",
-  "Czech Republic", "Denmark", "Estonia", "Finland", "France",
-  "Germany", "Greece", "Hungary",  "Italy",
-  "Latvia", "Lithuania", "Luxembourg", "Malta", "Netherlands",
-  "Poland", "Portugal", "Romania", "Slovakia", "Slovenia",
-  "Spain", "Sweden"
-)
-
-eu_synth <- c("Australia", "Saudi Arabia", "Russian Federation", "Peru", "Kuwait", "Bahrain","Singapore","Switzerland", "Hong Kong", "United States of America",  "Thailand", "Canada", "Mauritius", "Qatar", "Norway", "Israel", "Malaysia", "Jordan", "Albania", "Serbia", "Ireland", "Jersey", "Macao","United Arab Emirates", "Vietnam [Viet Nam]", "Turkey")
-
-
-data <- data %>%
-  filter(Domicile_named_country %in% c(eu_real, eu_synth))
-
-data <- data %>%
-  mutate(
-    real_EU  = ifelse(Domicile_named_country %in% eu_real, 1, 0),
-    synth_EU = ifelse(Domicile_named_country %in% eu_synth, 1, 0),
-    EU_group = case_when(
-      Domicile_named_country %in% eu_real ~ "Real_EU",
-      Domicile_named_country %in% eu_synth ~ "Synthetic_EU",
-      TRUE ~ "Other"
-    )
-  )
-
-```
-
-```{r}
 library(WDI)
 library(WDI)
-library(dplyr)
 library(countrycode)
 
-# years actually present in your data
+#We will make a copy of the database so the following regressions can be executed. 
+
+data<-data_UCAS
+
+# years actually present in the data 
+
 yr_min <- min(data$Year, na.rm = TRUE)
 yr_max <- min(max(data$Year, na.rm = TRUE), 2024)  # cap to available WB years if needed
 
-# only pull countries that are in your dataset
+# only pull countries that are in the data set
+
 iso_list <- data %>%
   mutate(iso3c = countrycode(Domicile_named_country, "country.name", "iso3c")) %>%
   filter(!is.na(iso3c)) %>%
@@ -1286,14 +1254,14 @@ data_controls <- data %>%
   left_join(controls, by = c("iso3c", "Year"))
 ```
 
-\## ATE wealth heterogeneity FO
+## ATE wealth heterogeneity 
 
 ```{r}
 library(fixest)
 library(dplyr)
 library(modelsummary)
 
-# Base Panel Dataset
+# Base Panel Data set
 data_panel <- data_controls %>%
   mutate(
     log_app = log(Applicants),
@@ -1394,9 +1362,8 @@ library(fixest)
 library(dplyr)
 library(modelsummary)
 
-# ----------------------------
-# 1. build clean analysis data
-# ----------------------------
+# Here we will recycle the "data_panel" data set that we used in the previous chunk because we know that it is reliabl abd already contains the macroeconomic fundamentals
+
 df_sat <- data_panel %>%
   mutate(
     Domicile_named_country = as.character(Domicile_named_country),
@@ -1432,16 +1399,10 @@ df_sat <- data_panel %>%
     !is.na(treated_factor)
   )
 
-# optional check
-table(df_sat$treated_factor == "CONTROL")
-sort(unique(df_sat$treated_factor))[1:10]
-
 ```
 
 ```{r}
-# ----------------------------
 # 2. saturated DiD models
-# ----------------------------
 
 # S1: saturated DiD only
 s1 <- feols(
@@ -1679,72 +1640,3 @@ write.xlsx(
 
 ```
 
-```{r}
-h <- hist(
-  eu_control$GDPpc,
-  breaks = "FD",
-  freq = FALSE,
-  right = FALSE,
-  plot = TRUE 
-)
-
-plot(
-  h$mids, h$density,
-  type = "l",
-  lwd = 2,
-  xlab = "GDP per cap",
-  ylab = "Density"
-)
-
-```
-
-Note on how this was constructed: Assuming that there are K bin boundaries $b_0\leq b_1 \leq \dots\leq b_K$ separated into specific intervals $I_p=[b_p,b_{p+1}]$, the midpoint of those intervals is $m_p=\frac{b_p+b_{p+1}}{2}$ and the bins are defined as $\Delta_p=b_{p+1}-b_p$. $freq_p$ are the number of observations filling into bin $p$. The densities are given by:
-
-$$
-density_p=\frac{freq_p}{obs \cdot \Delta_p }
-$$ where $obs$ denotes the number of observations in the sample. By construction the histogram integrates to unity $\left( E[x]=\int_{-\infty}^{+\infty} f(x)x dx=1 \right)$, hence the discrete version of this is given by:
-
-$$
-\sum_{p=1}^K density_p\cdot \Delta_p
-$$ where $bin_p$ is $b_{j+1}-b_j$ (i.e. the sum of the probabilities of observing bin p somewhere in the distribution). To show the unity summation consider:
-
-$$
-\sum_{1}^K density_p\cdot \Delta_p=\sum_{1}^K \frac{freq_p}{obs \cdot \Delta_p }\cdot \Delta_p= \frac{\sum_{1}^K freq_p}{n}=n/n=1
-$$
-
-```{r}
-# Total observations
-n <- sum(h$counts)
-
-# Bin widths
-binwidth <- diff(h$breaks)
-
-# Manual density calculation
-density_manual <- h$counts / (n * binwidth)
-
-# Verification table
-density_check <- data.frame(
-  bin_left   = h$breaks[-length(h$breaks)],
-  bin_right  = h$breaks[-1],
-  midpoint   = h$mids,
-  count      = h$counts,
-  binwidth   = binwidth,
-  density_R  = h$density,
-  density_manual = density_manual,
-  diff = h$density - density_manual
-)
-
-density_check
-
-```
-
-R says 13 rows hence 13 bins. Lets test for some of them. The second bin starts from 10000 to 20000 and has a midpoint of 15000, consisting o of 18 obs.
-
-```{r}
-delta_2=20000-10000
-density_2=18/(sum(h$counts)*delta_2)
-
-density_2
-```
-
-we are fine then.

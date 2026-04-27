@@ -78,8 +78,6 @@ table(data_UCAS$EU_group)
 
 260/10 = 26 real European countries (excl. Ireland because it didn't face the same restrictions (-1) and excluding UK for obvious reasons (-1)) and 260/10=26 synthetic countries (including Ireland because it is the most plausible counter-factual)
 
-
-
 # Saturated DID
 
 ## S-DID design with DK errors
@@ -233,7 +231,6 @@ $$
 Vcov(\beta)=(X'X)^{-1}X'\Omega X(X'X)^{-1}
 $$ where the $\Omega =\diag(\varepsilon_it^2)$ which is going to create some variance so chill.
 
-
 ### Placebo graph
 
 This chunk implements a placebo event-study to test for spurious pre-treatment dynamics. A fake treatment year is set to 2018 and event time is defined as $\ell = t - 2018$. The specification `i(event_time_pl2018, EU, ref = -1)` estimates EU–control differences for each relative year while normalizing the year immediately before the placebo treatment ($\ell=-1$) to zero. Country and year fixed effects are included, and standard errors are clustered at the country level. The resulting coefficients are plotted to visually assess whether significant effects appear around the placebo treatment date.
@@ -312,7 +309,7 @@ wald(m_leads_only, c(
 
 ### Randomized treatment assignment {#sec-randomized-treatment-assignment}
 
-First we need to prepare the database: 
+First we need to prepare the database:
 
 ```{r}
 set.seed(123)
@@ -338,7 +335,7 @@ rand_treat_data<-rand_treat_data%>% filter(Domicile_named_country!="All")
 
 ```
 
-Next we design the placebo control pool. 
+Next we design the placebo control pool.
 
 ```{r}
 # define placebo control pool: only non-EU countries remaining in the cleaned sample. The set-diff operator creates the control pool by subtracting the non-EU observations from all the unique obs in the database
@@ -403,7 +400,8 @@ iplot(
   main = "Placebo with randomized treatment assignment"
 )
 ```
-Next we will perform the placebo assignment with only the data that has the entire eu real excluded 
+
+Next we will perform the placebo assignment with only the data that has the entire eu real excluded
 
 ```{r}
 rand_treat_data<-rand_treat_data[rand_treat_data$Domicile_named_country %in% control_pool, ]
@@ -433,7 +431,8 @@ print(assignment_table)
 print(table(assignment_table$group))
 
 ```
-from @{Full_random_group} we know that the total number of non-eu countries is  157. Therefore  157-131=26. And we repeat the regression from @{r Random_REG}:
+
+from @Full_random_group we know that the total number of non-eu countries is 157. Therefore 157-131=26. And we repeat the regression from \@{r Random_REG}:
 
 ```{r}
 m_placebo_random2 <- feols(
@@ -923,6 +922,33 @@ run_pooled_did <- function(df, treated_vec, control_vec,
   return(list(model = m, data = df2))
 }
 
+run_Poisson_did <- function(df, treated_vec, control_vec,
+                            y = "Applicants",
+                            post_year = 2021,
+                            vcov_type = "DK") {
+  
+  df2 <- df %>%
+    dplyr::filter(Domicile_named_country %in% c(treated_vec, control_vec)) %>%
+    dplyr::mutate(
+      EU = Domicile_named_country %in% treated_vec,
+      Post = Year >= post_year,
+      Treat_Post = EU * Post
+    )
+  
+  formula <- as.formula(
+    paste0(y, " ~ Treat_Post | Domicile_named_country + Year")
+  )
+  
+  m <- fixest::fepois(
+    formula,
+    data = df2,
+    panel.id = ~ Domicile_named_country + Year,
+    vcov = vcov_type
+  )
+  
+  list(model = m, data = df2)
+}
+
 ```
 
 ```{r}
@@ -947,7 +973,22 @@ fits <- lapply(names(controls_list), function(nm) {
   )$model
 })
 
+fits_pois <- lapply(names(controls_list), function(nm) {
+  run_Poisson_did(
+    df = data[data$Year>2015,],
+    treated_vec = eu_real,
+    control_vec = controls_list[[nm]],
+    y = "Applicants",
+    post_year = 2021, 
+    vcov_type = "DK"
+  )$model
+})
+
 names(fits) <- names(controls_list)
+names(fits_pois) <- names(controls_list)
+
+fits
+fits_pois
 ```
 
 ```{r}
@@ -1254,7 +1295,7 @@ data_controls <- data %>%
   left_join(controls, by = c("iso3c", "Year"))
 ```
 
-## ATE wealth heterogeneity 
+## ATE wealth heterogeneity
 
 ```{r}
 library(fixest)
@@ -1639,4 +1680,3 @@ write.xlsx(
 )
 
 ```
-

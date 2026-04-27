@@ -5,37 +5,33 @@ output:
     df_print: paged
 ---
 
-This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
-
-Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
-
-
 ```{r}
 library(dplyr)
 library(ggplot2)
 library(tidyr)
 ```
 
-#On agregate level
+# On aggregate level
 
-We use the following equation: 
+We use the following equation:
 
-\[
+$$
 PV_{loan}=\sum_{t=1}^T\frac{\alpha \cdot \max\{0, Y_0(1+g)^{t-1}-\tau\}}{(1+r)^t}
-\]
+$$
 
-hence the k is calculated with the following assumptions: 
+hence the k is calculated with the following assumptions:
 
-\[
+$$
 \Delta \log(P_i)=log(22200)-log\left(\sum_{t=1}^T\frac{\alpha \cdot \max\{0, Y_i(1+g)^{t-1}-\tau\}}{(1+r)^t}\right)
-\]
+$$
 
-where $Y_i$ is the starting salary in country i. 
+where $Y_i$ is the starting salary in country i.
 
 ```{r}
 
 # Present value of repayments
 # (payments stop when loan is repaid)
+
 pv_loan <- function(Y0,
                     L = 9250,        # loan principal (1 year)
                     alpha = 0.09,    # repayment rate
@@ -196,8 +192,7 @@ ggplot(curve_df, aes(PV, elasticity)) +
 
 ```
 
-#Country specific present values 
-
+# Country specific present values
 
 ```{r}
 library(readxl)
@@ -221,17 +216,21 @@ wages<-merge(wages,betas_saturated_model, by="Country" )
 ```
 
 ```{r}
-wages$elasticity_new <- as.numeric(wages$Estimate) / wages$k_i
-wages$elasticity_old <- as.numeric(wages$Estimate) / 0.86
+wages$elasticity_new_TWFE <- as.numeric(wages$Estimate_TWFE) / wages$k_i
+wages$elasticity_new_OWFE <- as.numeric(wages$Estimate_OWFE) / wages$k_i
+wages$elasticity_new_Pooled <- as.numeric(wages$Estimate_Pooled) / wages$k_i
+wages$elasticity_TWFE <- as.numeric(wages$Estimate_TWFE) / 0.86
+wages$elasticity_OWFE <- as.numeric(wages$Estimate_OWFE) / 0.86
+wages$elasticity_Pooled <- as.numeric(wages$Estimate_Pooled) / 0.86
 ```
 
 ```{r}
-results_country <- wages[, c("Country", "Wage_EURO", "PV_loan", "k_i", "elasticity_new", "elasticity_old")]
+results_country <- wages[, c("Country", "Wage_EURO", "PV_loan", "k_i", "elasticity_new_TWFE","elasticity_new_OWFE","elasticity_new_Pooled", "elasticity_TWFE", "elasticity_OWFE","elasticity_Pooled" )]
 
 results_country
 ```
 
-#Correlations
+# Correlations
 
 ```{r}
 library(WDI)
@@ -248,7 +247,7 @@ wages <- merge(
   by.y = "country",
   all.x = TRUE
 )
-names(wages)[9]<-"GDP_PPP"
+names(wages)[which(names(wages) == "NY.GDP.PCAP.PP.KD")]<-"GDP_PPP"
 ```
 
 ```{r}
@@ -261,7 +260,7 @@ df$log_gdp <- log(df$GDP_PPP)
 
 df_long <- df %>%
   pivot_longer(
-    cols = c(elasticity_old, elasticity_new),
+    cols = c(elasticity_TWFE, elasticity_new_TWFE),
     names_to = "type",
     values_to = "elas"
   )
@@ -270,10 +269,10 @@ ggplot(df_long, aes(x = log_gdp, y = elas, color = type)) +
   geom_point(size = 3) +
   geom_smooth(method = "lm", se = FALSE) +
   scale_color_manual(
-    values = c("elasticity_old" = "steelblue",
-               "elasticity_new" = "darkred"),
-    labels = c("elasticity_old" = "equal k",
-               "elasticity_new" = "heterogenous k")
+    values = c("elasticity_TWFE" = "steelblue",
+               "elasticity_new_TWFE" = "darkred"),
+    labels = c("elasticity_TWFE" = "equal k",
+               "elasticity_new_TWFE" = "heterogenous k")
   ) +
   labs(
     x = "Log GDP per capita (PPP)",
@@ -285,223 +284,128 @@ ggplot(df_long, aes(x = log_gdp, y = elas, color = type)) +
   theme_classic()
 ```
 
+# Regression comparisons (TWFE vs OWFE vs Pooled)
+
+Consider the following panel data models:
+
+$$
+Y_{it} = \beta_i D_{it} + \alpha_i + \varepsilon_{it} \quad \text{(One-way fixed effects)}
+$$
+
+$$
+Y_{it} = \beta_i D_{it} + \alpha_i + \gamma_t + \varepsilon_{it} \quad \text{(Two-way fixed effects)}
+$$
+
+where $i$ indexes countries and $t$ indexes time. The parameter $\beta_i$ captures the country-specific treatment effect (elasticity), $\alpha_i$ are country fixed effects, and $\gamma_t$ are time fixed effects. The one-way fixed effects estimator removes country means:
+
+$$
+\tilde{Y}_{it}^{(1)} = Y_{it} - \bar{Y}_i
+$$
+
+The two-way fixed effects estimator removes both country and time means:
+
+$$
+\tilde{Y}_{it}^{(2)} = Y_{it} - \bar{Y}_i - \bar{Y}_t + \bar{Y}
+$$
+
+Subtracting the one-way transformation from the two-way transformation yields:
+
+$$
+\tilde{Y}_{it}^{(2)} - \tilde{Y}_{it}^{(1)} = -\bar{Y}_t + \bar{Y} 
+$$
+$$
+\Rightarrow \tilde{Y}_{it}^{(2)} = \tilde{Y}_{it}^{(1)} - (\bar{Y}_t - \bar{Y})
+$$
+
+If $\gamma_t$ represents a common time effect across countries, then:
+
+$$
+\bar{Y}_t - \bar{Y} \approx \gamma_t
+$$
+
+so that:
+
+$$
+\tilde{Y}_{it}^{(2)} = \tilde{Y}_{it}^{(1)} - \gamma_t
+$$
+
+Let $\hat{\beta}_i^{OWFE}$ and $\hat{\beta}_i^{TWFE}$ denote the country-specific elasticities obtained from the one-way and two-way fixed effects models, respectively. Then:
+
+$$
+\hat{\beta}_i^{TWFE} = \hat{\beta}_i^{OWFE} - c
+$$
+
+where $c$ is a constant given by the average time effect:
+
+$$
+c = \frac{1}{T} \sum_{t} \gamma_t
+$$
+
+This implies a linear relationship between the two estimators:
+
+$$
+\hat{\beta}_i^{TWFE} = \alpha + 1 \cdot \hat{\beta}_i^{OWFE}, \quad \text{with } \alpha = -c
+$$
+
+Thus, the slope is equal to one and the difference between the two estimators is a constant shift.
 
 ```{r}
-reg_old <- lm(elasticity_old ~ log_gdp, data = df)
+reg_old <- lm(elasticity_TWFE ~ log_gdp, data = df)
 
-reg_new <- lm(elasticity_new ~ log_gdp, data = df)
+reg_new_TWFE <- lm(elasticity_new_TWFE ~ log_gdp, data = df)
 
-stargazer::stargazer(reg_old,reg_new, type="text")
-library(broom)
+# Now the other two regressions
 
-table_regs <- bind_rows(
-  tidy(reg_old) %>% mutate(model = "Old elasticity"),
-  tidy(reg_new) %>% mutate(model = "Corrected elasticity")
-)
+reg_old_OWFE <- lm(elasticity_OWFE  ~ log_gdp, data = df)
+reg_old_Pooled <- lm(elasticity_Pooled ~ log_gdp, data = df)
 
-table_regs
-
-beta_old <- coef(reg_old)["log_gdp"]
-beta_new <- coef(reg_new)["log_gdp"]
-
-diff <- beta_new - beta_old
-
-diff
-```
-
-```{r}
-comparison <- data.frame(
-  Model = c("Old elasticity", "Corrected elasticity"),
-  GDP_coefficient = c(beta_old, beta_new)
-)
-
-comparison
-
-data.frame(
-  Difference_in_gradient = diff
-)
-```
-
-```{r}
-library(ggplot2)
-library(ggrepel)
-
-ggplot(df, aes(x = elasticity_old, y = elasticity_new)) +
-  
-  geom_point(size = 3, color = "steelblue") +
-  
-  geom_abline(
-    slope = 1,
-    intercept = 0,
-    linetype = "dashed",
-    color = "black",
-    linewidth = 1
-  ) +
-  
-  geom_text_repel(
-    aes(label = paste0(Country, " (", round(elasticity_new,2), ")")),
-    size = 3.5
-  ) +
-  
-  labs(
-    x = "Elasticity with equal k",
-    y = "Elasticity with country-specific k",
-    title = "Comparison of Elasticity Estimates",
-    subtitle = "Countries above the line have larger elasticities after correction"
-  ) +
-  
-  theme_classic()
+stargazer::stargazer(reg_old,reg_new_TWFE,reg_old_OWFE,reg_old_Pooled ,  type="text")
 ```
 
 #Other interesting correlations
 
 ```{r}
-# --- WB correlations block: pull macro vars + merge + quick exploration ---
-
 # Packages
-pkgs <- c("WDI","dplyr","tidyr","ggplot2","broom","countrycode","purrr","ggrepel")
-to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
-if(length(to_install) > 0) install.packages(to_install)
-
 library(WDI)
 library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(broom)
 library(countrycode)
+library(broom)
 library(purrr)
-library(ggrepel)
 
-# 1) EU ISO2 list (EU27; add/remove if needed)
-eu_iso2 <- c("AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR",
-             "HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK",
-             "SI","ES","SE")
-
-# 2) Indicators to pull (World Bank)
-# Note: some education-return indicators can be sparse; the code handles missingness.
-wb_indicators <- c(
-  gdp_ppp_pc_const = "NY.GDP.PCAP.PP.KD",   # GDP per capita, PPP (constant intl $)
-  gini            = "SI.POV.GINI",         # Gini index
-  youth_unemp     = "SL.UEM.1524.ZS",      # Youth unemployment (% ages 15-24)
-  educ_spend_gdp  = "SE.XPD.TOTL.GD.ZS",   # Government expenditure on education (% GDP)
-  tertiary_enroll = "SE.TER.ENRR",         # Tertiary school enrollment, gross (%)
-  net_migration   = "SM.POP.NETM",         # Net migration
-  exrate_lcu_usd  = "PA.NUS.FCRF",         # Official exchange rate (LCU per US$)
-  priv_credit_gdp = "FS.AST.PRVT.GD.ZS",   # Domestic credit to private sector (% GDP)
-  sec_complete    = "SE.SEC.CUAT.LO.ZS"    # Lower secondary completion rate (%)
+# EU countries
+eu_iso2 <- c(
+  "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR",
+  "HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK",
+  "SI","ES","SE"
 )
 
-# 3) Pull WB data
-# Pick a target year; if some series are missing that year, we'll fall back to latest available.
-target_year <- 2022
-
-wb_raw <- WDI(
-  country   = eu_iso2,
-  indicator = wb_indicators,
-  start     = target_year,
-  end       = target_year,
-  extra     = TRUE,
-  cache     = NULL
+# World Bank indicators
+indicators <- c(
+  gdp_ppp_pc      = "NY.GDP.PCAP.PP.KD",
+  gini            = "SI.POV.GINI",
+  youth_unemp     = "SL.UEM.1524.ZS",
+  educ_spend_gdp  = "SE.XPD.TOTL.GD.ZS",
+  tertiary_enroll = "SE.TER.ENRR",
+  net_migration   = "SM.POP.NETM"
 )
 
-# 4) Make a clean WB dataset + map to your Country names
-wb <- wb_raw %>%
-  transmute(
-    iso2c,
-    year,
-    Country = country,
-    across(all_of(names(wb_indicators)), as.numeric)
-  )
+# Download World Bank data
+wb <- WDI(
+  country = eu_iso2,
+  indicator = indicators,
+  start = 2022,
+  end = 2022
+) %>%
+  select(iso2c, country, all_of(names(indicators)))
 
-# If your df uses different naming, prefer ISO mapping:
-# df must contain at least: Country, elasticity_old, elasticity_new
-# (If you already have iso codes, replace this with a direct join by iso2c.)
-df2 <- df %>%
-  mutate(
-    iso2c = countrycode(Country, origin = "country.name", destination = "iso2c")
-  )
+# Add ISO codes to your elasticity data
+df_clean <- df %>%
+  mutate(iso2c = countrycode(Country, "country.name", "iso2c"))
 
-# 5) Merge elasticities with WB vars
-dat <- df2 %>%
+# Merge elasticities with World Bank data
+dat <- df_clean %>%
   left_join(wb, by = "iso2c")
-names(dat)[1]<-"Country"
 
-# 6) Quick correlations with elasticity_new (pairwise complete obs)
-corrs <- names(wb_indicators) %>%
-  set_names() %>%
-  map_dfr(function(v){
-    x <- dat[[v]]
-    y <- dat$elasticity_new
-    out <- suppressWarnings(cor.test(x, y, use = "pairwise.complete.obs"))
-    tibble(
-      variable = v,
-      n = sum(complete.cases(x, y)),
-      cor = unname(out$estimate),
-      p_value = out$p.value
-    )
-  }) %>%
-  arrange(p_value)
-
-print(corrs)
-
-# 7) Separate regressions: elasticity_new ~ each WB variable (one-at-a-time)
-regs <- names(wb_indicators) %>%
-  set_names() %>%
-  map_dfr(function(v){
-    dsub <- dat %>% select(Country, elasticity_new, all_of(v)) %>% filter(complete.cases(.))
-    if(nrow(dsub) < 8) return(tibble(variable=v, n=nrow(dsub), estimate=NA, std.error=NA, statistic=NA, p.value=NA))
-    m <- lm(reformulate(v, response = "elasticity_new"), data = dsub)
-    td <- tidy(m) %>% filter(term == v)
-    td %>%
-      transmute(variable = v, n = nrow(dsub),
-                estimate, std.error, statistic, p.value)
-  }) %>%
-  arrange(p.value)
-
-print(regs)
-
-# 8) A couple of “nice” plots for the top 2 most significant correlations (if any)
-top_vars <- regs %>% filter(!is.na(p.value)) %>% slice_head(n = 2) %>% pull(variable)
-
-for(v in top_vars){
-  p <- ggplot(dat, aes(x = .data[[v]], y = elasticity_new)) +
-    geom_point(size = 3) +
-    geom_smooth(method = "lm", se = FALSE) +
-    ggrepel::geom_text_repel(aes(label = Country), size = 3, max.overlaps = 20) +
-    labs(
-      x = v,
-      y = "elasticity_new",
-      title = paste0("elasticity_new vs ", v),
-      subtitle = paste0("World Bank ", target_year, " (pairwise complete cases)")
-    ) +
-    theme_classic()
-  print(p)
-}
-
-# 9) Optional: run the same for elasticity_old (quick compare)
-regs_old <- names(wb_indicators) %>%
-  set_names() %>%
-  map_dfr(function(v){
-    dsub <- dat %>% select(Country, elasticity_old, all_of(v)) %>% filter(complete.cases(.))
-    if(nrow(dsub) < 8) return(tibble(variable=v, n=nrow(dsub), estimate=NA, std.error=NA, statistic=NA, p.value=NA))
-    m <- lm(reformulate(v, response = "elasticity_old"), data = dsub)
-    td <- tidy(m) %>% filter(term == v)
-    td %>%
-      transmute(variable = v, n = nrow(dsub),
-                estimate, std.error, statistic, p.value)
-  }) %>%
-  arrange(p.value)
-
-print(regs_old)
-
-# 10) Optional: combined comparison table (old vs new slopes per WB variable)
-compare <- regs_old %>%
-  rename(est_old = estimate, p_old = p.value, n_old = n) %>%
-  left_join(regs %>% rename(est_new = estimate, p_new = p.value, n_new = n), by = "variable") %>%
-  mutate(diff_new_minus_old = est_new - est_old) %>%
-  arrange(p_new)
-
-print(compare)
 ```
 
 ```{r}
@@ -509,15 +413,12 @@ library(dplyr)
 library(stargazer)
 
 wb_vars <- c(
-  "gdp_ppp_pc_const",
+  "gdp_ppp_pc",
   "gini",
   "youth_unemp",
   "educ_spend_gdp",
   "tertiary_enroll",
-  "net_migration",
-  "exrate_lcu_usd",
-  "priv_credit_gdp",
-  "sec_complete"
+  "net_migration"
 )
 
 min_n <- 8  # minimum complete cases to include a model
@@ -527,13 +428,13 @@ models_new <- list()
 kept_vars  <- c()
 
 for (v in wb_vars) {
-  dsub <- dat %>% select(elasticity_new, all_of(v)) %>% filter(complete.cases(.))
+  dsub <- dat %>% select(elasticity_new_TWFE, all_of(v)) %>% filter(complete.cases(.))
 
   # Skip if too few obs or regressor has no variation
   if (nrow(dsub) < min_n) next
   if (sd(dsub[[v]], na.rm = TRUE) == 0) next
 
-  m <- lm(reformulate(v, response = "elasticity_new"), data = dsub)
+  m <- lm(reformulate(v, response = "elasticity_new_TWFE"), data = dsub)
 
   models_new[[v]] <- m
   kept_vars <- c(kept_vars, v)
@@ -548,4 +449,3 @@ stargazer(
   type = "text"
 )
 ```
-

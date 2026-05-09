@@ -312,8 +312,7 @@ Subtracting the one-way transformation from the two-way transformation yields:
 
 $$
 \tilde{Y}_{it}^{(2)} - \tilde{Y}_{it}^{(1)} = -\bar{Y}_t + \bar{Y} 
-$$
-$$
+$$ $$
 \Rightarrow \tilde{Y}_{it}^{(2)} = \tilde{Y}_{it}^{(1)} - (\bar{Y}_t - \bar{Y})
 $$
 

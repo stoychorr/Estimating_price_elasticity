@@ -149,6 +149,13 @@ summary(m_sat_DK2)
 
 ```
 
+```{r}
+summary(df[,c(1,2,3,10,11,12)] %>% filter(Treated==1))
+summary(df[,c(1,2,3,10,11,12)] %>% filter(Treated==0))
+```
+
+
+
 ## Event study
 
 This chunk estimates an event-study difference-in-differences model using `fixest`. We define treatment status as $EU_i=1$ for countries in `eu_real` and construct event time as $\ell = t - 2020$, so $\ell=0$ corresponds to year 2020. The regression uses `i(event_time, EU, ref = 0)` to estimate a full set of dynamic EU–control differences for each relative year $\ell$, normalized to zero in the reference period $\ell=0$. Country and year fixed effects are included, standard errors are clustered, and `iplot()` visualizes the estimated dynamic coefficients with $\ell=0$ shown as the reference line. $$

@@ -1,0 +1,20 @@
+Downloaded reference papers
+
+Source manuscript  The_Brexit_Tuition_Shock_v4_final(3).docx
+PDF files downloaded  12
+
+Arel-Bundock et al. (2018).pdf
+Arkhangelsky et al. (2021) - preprint.pdf
+Brown (2011).pdf
+Calhoun (2017).pdf
+Clifton-Sprigg et al. (2025).pdf
+Dwenger et al. (2012) - working paper version.pdf
+Locke and Marini (2021).pdf
+Luthra (2020).pdf
+McFadden (1974).pdf
+Neville et al. (2024).pdf
+Solís (2017) - working paper version.pdf
+Sá (2014).pdf
+
+The spreadsheet records which files are publisher versions, accepted manuscripts, preprints, or working-paper versions.
+References that could not be retrieved are marked in the spreadsheet with the reason or limitation.

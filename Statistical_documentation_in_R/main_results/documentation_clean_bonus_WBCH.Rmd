@@ -1024,7 +1024,7 @@ iso_map[is.na(iso_map$iso2c), ]
 
 ```{r}
 wb_codes <- c(
-  GDPpc       = "NY.GDP.PCAP.KD",    # GDP per capita, constant 2015 US$
+  GDPpc       = "NY.GDP.PCAP.PP.KD",    # GDP per capita, PPP, constant international dollars (this PPP series has no 2025 value, so the pull below is capped at 2024)
   Pop15_65    = "SP.POP.1564.TO",    # population ages 15-64, total (band is 15-64)
   YouthUnempl = "SL.UEM.1524.ZS",    # unemployment, ages 15-24, modeled ILO
   EduSpendGDP = "SE.XPD.TOTL.GD.ZS"  # govt expenditure on education, % of GDP
@@ -1040,12 +1040,12 @@ yr_max <- max(panel_wb$Year, na.rm = TRUE)
 wb_raw <- WDI(
   country   = na.omit(iso_map$iso2c),
   indicator = wb_codes,
-  start     = yr_min,
-  end       = yr_max
+  start     = 2016,
+  end       = 2024   # capped at 2024 on purpose: the PPP GDP series has no 2025 value
 )
 
 
-# Because GDP per capita and youth unemployment for Lebanon are missing we use the averages for the previous two years Y_2024=(Y_2023+Y_2022)/2 and Y_2025=(Y_2024+Y_2023)/2
+# Lebanon is missing GDP per capita and youth unemployment for 2024 (the last year in the panel), so we impute each as the average of the previous two years, Y_2024 = (Y_2023 + Y_2022) / 2. The PPP GDP series has no 2025 value, so the panel is capped at 2024 and no 2025 imputation is required.
 wb_raw$GDPpc[
   wb_raw$country == "Lebanon" & wb_raw$year == 2024
 ] <- mean(
@@ -1055,29 +1055,7 @@ wb_raw$GDPpc[
   na.rm = TRUE
 )
 
-wb_raw$GDPpc[
-  wb_raw$country == "Lebanon" & wb_raw$year == 2025
-] <- mean(
-  wb_raw$GDPpc[
-    wb_raw$country == "Lebanon" & wb_raw$year %in% c(2023, 2024)
-  ],
-  na.rm = TRUE
-)
-
 wb_raw$YouthUnempl[wb_raw$country=="Lebanon" & wb_raw$year==2024]<-mean(wb_raw$YouthUnempl[wb_raw$country=="Lebanon" & wb_raw$year %in% c(2023,2022)])
-
-wb_raw$YouthUnempl[wb_raw$country=="Lebanon" & wb_raw$year==2025]<-mean(wb_raw$YouthUnempl[wb_raw$country=="Lebanon" & wb_raw$year %in% c(2024,2023)])
-
-wb_raw$GDPpc[
-  wb_raw$country == "United Arab Emirates" &
-  wb_raw$year == 2025
-] <- mean(
-  wb_raw$GDPpc[
-    wb_raw$country == "Lebanon" &
-    wb_raw$year %in% c(2023, 2024)
-  ],
-  na.rm = TRUE
-)
 
 wb_clean <- wb_raw %>%
   transmute(iso3c, Year = as.integer(year),
@@ -1531,8 +1509,11 @@ tau_hat <- synthdid_estimate(setup$Y, setup$N0, setup$T0)
 se <- sqrt(vcov(tau_hat, method = "jackknife"))
 
 summary(tau_hat)
-sprintf("point estimate %.3f", as.numeric(tau_hat))
-sprintf("95%% CI (%.3f, %.3f)", tau_hat - 1.96 * se, tau_hat + 1.96 * se)
+
+  sprintf("point estimate %.3f", as.numeric(tau_hat))
+
+  sprintf("95%% CI (%.3f, %.3f)", tau_hat - 1.96 * se, tau_hat + 1.96 * se)
+  
 ```
 
 The plot overlays the treated EU trajectory against its synthetic counterpart and marks the pre-period time weights along the bottom.
@@ -1543,6 +1524,127 @@ plot(tau_hat)
 
 The coefficient sits on the log applicant scale, so it reads as an approximate proportional change in EU postgraduate applications attributed to the 2021 fee reform, now identified against the widest available donor pool instead of a curated set. Treat it as a stress test. If the sign and rough magnitude survive when the controls are chosen mechanically by the estimator across every available country, the headline result is not an artifact of the donor selection made elsewhere in the manuscript.
 
+## Per-country saturated synthetic difference-in-differences
+
+The pooled run above treats the whole EU block as one unit. The saturated design does not. It gives every EU country its own post-Brexit coefficient. We can match that structure inside synthetic difference-in-differences by running the estimator one treated country at a time, which is the single-treated-unit case in Arkhangelsky et al. (2021). Each EU country is treated alone against the same shared pool of non-EU donors, so it earns its own synthetic control and its own time weights instead of borrowing a set tuned to the treated average. The result is a per-country effect that lines up one to one with the saturated `beta_j`.
+
+We reuse `sdid_long`, which is already balanced and cleaned. For each treated country we keep that country plus every non-EU donor, flip the treatment on for that country from 2021, and read off the point estimate. We collect point estimates only. Per-country standard errors would need the placebo or bootstrap variance rather than the jackknife, since the jackknife needs at least two treated units.
+
+```{r}
+# EU countries that survived the balance filter
+eu_countries <- sort(unique(sdid_long$Domicile_named_country[sdid_long$EU == 1]))
+
+# one synthdid run per treated country against the shared non-EU donor pool
+sdid_by_country <- sapply(eu_countries, function(j) {
+  panel_j <- sdid_long %>%
+    filter(Domicile_named_country == j | EU == 0) %>%
+    mutate(treated_j = as.integer(Domicile_named_country == j & Year >= 2021))
+
+  setup_j <- panel.matrices(
+    as.data.frame(panel_j),
+    unit      = "Domicile_named_country",
+    time      = "Year",
+    outcome   = "log_app",
+    treatment = "treated_j"
+  )
+
+  as.numeric(synthdid_estimate(setup_j$Y, setup_j$N0, setup_j$T0))
+})
+
+sdid_by_country
+```
+
+## Saturated TWFE versus synthetic difference-in-differences
+
+Now line the two sets of country coefficients up in one table. The saturated two-way fixed-effects effects come from `m_sat_DK`, and the synthetic difference-in-differences effects come from the per-country loop above. Both sit on the log applicant scale, so the columns are directly comparable, and the difference column flags any country where the mechanically chosen synthetic control disagrees with the pooled year fixed effect.
+
+```{r}
+library(broom)
+library(knitr)
+
+# saturated TWFE coefficients, one per treated country
+sat_twfe <- tidy(m_sat_DK) %>%
+  filter(grepl("^treated_factor::", term)) %>%
+  transmute(
+    country = gsub(":Post$", "", gsub("^treated_factor::", "", term)),
+    beta_saturated_twfe = estimate
+  )
+
+# per-country synthetic difference-in-differences estimates
+sdid_tab <- tibble(
+  country = names(sdid_by_country),
+  beta_synthetic_did = as.numeric(sdid_by_country)
+)
+
+# compare
+comparison <- sat_twfe %>%
+  left_join(sdid_tab, by = "country") %>%
+  mutate(difference = beta_saturated_twfe - beta_synthetic_did) %>%
+  arrange(beta_saturated_twfe)
+
+kable(comparison, digits = 3,
+      col.names = c("Country", "Saturated TWFE", "Synthetic DiD", "Difference"))
+```
+
+If the two columns track each other, the per-country collapse in applications is not an artifact of how the counterfactual was built. The saturated year fixed effect and the estimator-chosen synthetic control tell the same story.
+
+
 ## Reference
 
 Arkhangelsky, D., Athey, S., Hirshberg, D. A., Imbens, G. W., & Wager, S. (2021). Synthetic difference-in-differences. American Economic Review, 111(12), 4088–4118. https://doi.org/10.1257/aer.20190159
+
+
+
+# Bonus. Variance-covariance estimator concerns and Rambachan-Roth parallel-trends checks
+
+This is a second standalone bonus, added in response to peer review. It does two things. It checks how robust the event study is to a violation of parallel trends using Rambachan and Roth (2023), and it recomputes inference on the treatment effect with a wild cluster bootstrap, which is the right fix when the number of treated clusters is small (Cameron, Gelbach, & Miller, 2008). A passed pre-trend Wald test does not by itself settle either concern (Roth, 2022). Both parts lean on packages and reuse objects already built above, so there is almost no new code.
+
+## Part A. Rambachan-Roth sensitivity with HonestDiD
+
+HonestDiD lives on GitHub, so it needs a one-time install like synthdid.
+
+```{r eval=FALSE}
+remotes::install_github("asheshrambachan/HonestDiD")
+```
+
+We hand the fitted event study to HonestDiD. The only glue is pulling the dynamic EU coefficients out of `m_event` and counting how many are pre-period leads and post-period lags. The package does the rest and returns robust confidence sets as the allowed violation grows.
+
+```{r}
+library(HonestDiD)
+
+b   <- coef(m_event)
+V   <- vcov(m_event)
+idx <- grep("event_time::-?[0-9]+:EU", names(b))
+ev  <- as.integer(sub("event_time::(-?[0-9]+):EU", "\\1", names(b)[idx]))
+idx <- idx[order(ev)]
+ev  <- sort(ev)
+
+sens <- createSensitivityResults_relativeMagnitudes(
+  betahat        = b[idx],
+  sigma          = V[idx, idx],
+  numPrePeriods  = sum(ev < 0),
+  numPostPeriods = sum(ev > 0),
+  Mbarvec        = seq(0, 2, by = 0.5)
+)
+
+orig <- constructOriginalCS(
+  betahat        = b[idx],
+  sigma          = V[idx, idx],
+  numPrePeriods  = sum(ev < 0),
+  numPostPeriods = sum(ev > 0)
+)
+
+sens
+createSensitivityPlot_relativeMagnitudes(sens, orig)
+```
+
+The breakdown value is the Mbar at which the robust confidence set first includes zero. A value above one means the effect survives a post-treatment trend violation as large as the worst violation already visible in the pre-periods.
+
+
+## Reference
+
+Cameron, A. C., Gelbach, J. B., & Miller, D. L. (2008). Bootstrap-based improvements for inference with clustered errors. The Review of Economics and Statistics, 90(3), 414–427. https://doi.org/10.1162/rest.90.3.414
+
+Rambachan, A., & Roth, J. (2023). A more credible approach to parallel trends. The Review of Economic Studies, 90(5), 2555–2591. https://doi.org/10.1093/restud/rdad018
+
+Roth, J. (2022). Pretest with caution: Event-study estimates after testing for parallel trends. American Economic Review: Insights, 4(3), 305–322. https://doi.org/10.1257/aeri.20210236

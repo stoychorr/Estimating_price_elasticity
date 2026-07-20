@@ -77,17 +77,19 @@ accent <- "#1F4E79"   # one muted navy accent, prints cleanly in greyscale
 # Prices and conversion
 L          <- 9250      # one year of tuition (loan principal), GBP
 Ppost      <- 22200     # post-reform headline fee, GBP
-eur_gbp    <- 0.86      # EUR -> GBP conversion
+eur_gbp    <- 0.85      # EUR -> GBP conversion,  
+
+#see https://www.exchangerates.org.uk/EUR-GBP-spot-exchange-rates-history-2024.html 
 
 # Homogeneous log price change used for the "equal k" benchmark.
 ## FIX 1: this used to be the literal 0.86 (the FX rate). It should be the
-## naive log fee change. log(22200) - log(9250) = 0.8755, close to 0.86,
-## which is exactly why the mix-up went unnoticed.
+## naive log fee change. log(22200) - log(9250) = 0.8755
+
 k_common   <- log(Ppost) - log(L)   # about 0.8755
 
 # Illustrative pooled elasticity for the aggregate section.
-## FIX 2: was -1.28 in the table and -1.265 in the plot. One value now.
-beta_pooled <- -1.08
+
+beta_pooled <- -1.109
 
 # Loan repayment parameters (UK ICR plan)
 loan_alpha <- 0.09      # repayment rate above threshold
@@ -326,7 +328,7 @@ eu_iso2 <- c(
 # ONE World Bank pull for the whole basket, 2022. GDP PPP rides in here too,
 # so the separate GDP-only pull the old version did is no longer needed.
 wb_indicators <- c(
-  gdp_ppp_pc      = "NY.GDP.PCAP.PP.KD",
+  gdp_ppp_pc      = "NY.GDP.PCAP.PP.KD", #It will change less results if left this way in both tables 
   gini            = "SI.POV.GINI",
   youth_unemp     = "SL.UEM.1524.ZS",
   educ_spend_gdp  = "SE.XPD.TOTL.GD.ZS",

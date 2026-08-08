@@ -623,42 +623,107 @@ nice_names <- c(
 
 wb_vars <- names(nice_names)
 
-# refit each bivariate model on standardized variables so slopes are comparable,
-# and carry the R-squared along
+# Refit each bivariate model on standardized variables so slopes are comparable,
+# carrying the R-squared, sample size, and HC1 inference.
+
 std_df <- bind_rows(lapply(wb_vars, function(v) {
-  d <- dat %>% select(y = elasticity_new_TWFE, x = all_of(v)) %>% filter(complete.cases(.))
+
+  d <- dat %>%
+    select(y = elasticity_new_TWFE, x = all_of(v)) %>%
+    filter(complete.cases(.))
+
   if (nrow(d) < 8 || sd(d$x) == 0) return(NULL)
-  d <- d %>% mutate(x = as.numeric(scale(x)), y = as.numeric(scale(y)))
+
+  d <- d %>%
+    mutate(
+      x = as.numeric(scale(x)),
+      y = as.numeric(scale(y))
+    )
+
   m <- lm(y ~ x, data = d)
+
   robust_tidy(m) %>%
     filter(term == "x") %>%
-    mutate(variable = nice_names[v], r2 = summary(m)$r.squared, n = nrow(d))
+    mutate(
+      variable = nice_names[v],
+      r2 = summary(m)$r.squared,
+      n = nrow(d)
+    )
 })) %>%
   mutate(
-    p_bh = p.adjust(p.value, method = "BH"),
-    sig_bh = p_bh < 0.05,
-    variable = factor(variable, levels = variable[order(estimate)])
+    p_hc1 = p.value,
+    sig_hc1 = p_hc1 < 0.05,
+    p_label = if_else(
+      p_hc1 < 0.001,
+      "p < .001",
+      sprintf("p = %.3f", p_hc1)
+    ),
+    variable = factor(
+      variable,
+      levels = variable[order(estimate)]
+    )
   )
 
-## theme_eer and accent are defined once now, in the setup chunk, so this
-## file no longer redefines them here with a different colour.
+std_df %>%
+  select(
+    variable,
+    estimate,
+    std.error,
+    conf.low,
+    conf.high,
+    p_hc1,
+    r2,
+    n
+  )
+
 ggplot(std_df, aes(estimate, variable)) +
-  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
-  geom_pointrange(aes(xmin = conf.low, xmax = conf.high, colour = sig_bh),
-                  linewidth = 0.8, size = 0.6) +
-  geom_text(aes(label = sprintf("R\u00B2 = %.2f, n = %d, BH p = %.3f", r2, n, p_bh)),
-            hjust = -0.25, vjust = -1, size = 3, colour = "grey35") +
-  scale_colour_manual(values = c(`TRUE` = "#8B0000", `FALSE` = "grey65"),
-                      guide = "none") +
-  scale_x_continuous(expand = expansion(mult = c(0.08, 0.18))) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    colour = "grey60",
+    linewidth = 0.4
+  ) +
+  geom_pointrange(
+    aes(
+      xmin = conf.low,
+      xmax = conf.high,
+      colour = sig_hc1
+    ),
+    linewidth = 0.8,
+    size = 0.6
+  ) +
+  geom_text(
+    aes(
+      label = sprintf(
+        "R² = %.2f, n = %d, %s",
+        r2,
+        n,
+        p_label
+      )
+    ),
+    hjust = -0.25,
+    vjust = -1,
+    size = 3,
+    colour = "grey35"
+  ) +
+  scale_colour_manual(
+    values = c(
+      `TRUE` = "#8B0000",
+      `FALSE` = "grey65"
+    ),
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.08, 0.18))
+  ) +
   labs(
     x = "Standardized association with loan-corrected elasticity",
     y = NULL,
     title = "Exploratory macroeconomic correlates of loan-corrected elasticity",
-    subtitle = "Standardized bivariate slopes with 95% intervals and BH-adjusted p-values",
+    subtitle = "Standardized bivariate slopes with 95% intervals and HC1 p-values",
     caption = paste(
       "Notes. Each row is a separate OLS regression of the loan-corrected TWFE elasticity",
-      "on one standardized indicator. Crimson marks BH-adjusted significance at the 5% level.",
+      "on one standardized indicator. Confidence intervals and p-values use HC1 standard errors.",
       sep = "\n"
     )
   ) +

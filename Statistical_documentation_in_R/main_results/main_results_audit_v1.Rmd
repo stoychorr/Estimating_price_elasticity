@@ -1,0 +1,1749 @@
+---
+title: "Brexit elasticities core results documentation"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  word_document: default
+  pdf_document: default
+---
+
+<!--
+Naming conventions used throughout this rebuild
+
+  apps_raw      single read of data_filtered_FOR_SECOND_ONLY.xlsx, never modified
+  apps_clean    full cleaned panel (Year > 2015), used for the donor-pool robustness
+  panel_main    the eu_real + eu_synth analysis frame, built once and reused read-only
+  panel_*       any other analysis frame derived from panel_main (panel_pre, panel_covid, panel_wb ...)
+
+Outcome is always log_app (precomputed once as log(Applicants)).
+Treatment columns keep their original names (Post, Post_COVID, EU, treated_factor)
+because the tidy/regex extraction code downstream depends on the fixest term strings
+treated_factor::<country>:Post and ...:Post_COVID.
+
+Nothing below mutates a shared global frame in place. Each design that needs a
+different Post definition gets its own named frame, so chunks can run in any order.
+-->
+
+# Prepare the dataset
+
+This chunk loads the main data set once and prepares the analysis sample. The Excel file containing the full applicant data set is imported (it is also pre-filtered). Two country groups are defined: EU member states (`eu_real`), the treated group, and a synthetic comparison set (`eu_synth`) used as the control pool. From the single read we build two frames. `panel_main` holds the baseline treated-plus-synthetic sample used by the headline models, and `apps_clean` holds the full cleaned panel restricted to years after 2015, used later for the donor-pool robustness checks.
+
+```{r}
+library(readxl)
+library(dplyr)
+
+# Read the applicant data ONCE. Everything downstream references this object.
+apps_raw <- read_excel(
+  "data_filtered_FOR_SECOND_ONLY.xlsx",
+  sheet = "full_data"
+)
+
+required_columns <- c("Domicile_named_country", "Year", "Applicants")
+stopifnot(all(required_columns %in% names(apps_raw)))
+
+eu_real <- c(
+  "Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus (European Union)",
+  "Czech Republic", "Denmark", "Estonia", "Finland", "France",
+  "Germany", "Greece", "Hungary",  "Italy",
+  "Latvia", "Lithuania", "Luxembourg", "Malta", "Netherlands",
+  "Poland", "Portugal", "Romania", "Slovakia", "Slovenia",
+  "Spain", "Sweden"
+)
+
+# Exclude aggregates, UK home nations, territories, dependencies, and legacy
+# labels consistently from every full-donor-pool analysis.
+non_countries <- c(
+  "England", "Scotland", "Wales", "Northern Ireland",
+  "Alderney", "Guernsey", "Jersey", "Isle of Man",
+  "Anguilla", "Bermuda", "British Antarctic Territory",
+  "British Indian Ocean Territory", "British Virgin Islands",
+  "Cayman Islands", "Falkland Islands (Malvinas)", "Gibraltar",
+  "Montserrat", "St Helena, Ascension & Tristan da Cunha",
+  "Turks and Caicos Islands", "Aland Islands", "Aruba", "Canary Islands",
+  "Christmas Island", "Curacao", "Faroe Islands", "French Guiana",
+  "French Polynesia", "Greenland", "Guadeloupe", "Guam", "Hong Kong",
+  "Macao", "Martinique", "Netherlands Antilles", "New Caledonia",
+  "Norfolk Island", "Northern Mariana Islands", "Puerto Rico", "Reunion",
+  "Sint Maarten (Dutch Part)", "St Barthelemy", "St Martin (French part)",
+  "Virgin Islands (US)", "Cyprus (Non-European Union)",
+  "Cyprus (Not otherwise specified)", "All",
+  "No information provided (Overseas)", "Not Known", "Stateless",
+  "USSR (Not In Use)", "French West Indies (Not In Use)"
+)
+```
+
+```{r}
+# Path to the control-group construction output. Defined once here so it is not
+# repeated. Make this relative if you move the bundle to another machine.
+control_group_file <- "control_group_output.xlsx"
+
+# Read the donor/weights sheet ONCE.
+donor_raw <- read_excel(control_group_file, sheet = "weights")
+
+eu_synth <- donor_raw$donor_country
+
+# Synthetic donors carry their computed regression weight; treated EU countries
+# get weight 1. Stack the two into a single lookup keyed on country name.
+regression_weights <- donor_raw %>%
+  select(Domicile_named_country = donor_country, regression_weight) %>%
+  bind_rows(
+    tibble(Domicile_named_country = eu_real, regression_weight = 1)
+  )
+```
+
+```{r eval=FALSE, include=FALSE}
+# legacy comparison (previous version of this manuscript used this composition)
+# c("Australia", "Saudi Arabia", "Russian Federation", "Peru", "Kuwait", "Bahrain","Singapore","Switzerland", "Hong Kong", "United States of America",  "Thailand", "Canada", "Mauritius", "Qatar", "Norway", "Israel", "Malaysia", "Jordan", "Albania", "Serbia", "Ireland", "Jersey", "Macao","United Arab Emirates", "Vietnam [Viet Nam]", "Turkey")
+```
+
+```{r}
+# Full cleaned panel (all countries present in the file, post-2015).
+# Used by the donor-pool robustness section.
+apps_clean <- apps_raw %>%
+  filter(Year > 2015, !Domicile_named_country %in% non_countries) %>%
+  mutate(
+    Domicile_named_country = as.character(Domicile_named_country),
+    Year    = as.integer(Year),
+    EU      = as.integer(Domicile_named_country %in% eu_real),
+    Post    = as.integer(Year >= 2021),
+    log_app = log(Applicants)
+  )
+
+stopifnot(
+  all(apps_clean$Applicants > 0),
+  all(is.finite(apps_clean$log_app))
+)
+```
+
+```{r}
+# panel_main: the baseline treated + synthetic analysis frame, built ONCE.
+# This single object replaces every later "df <- data_UCAS" copy and in-place
+# mutation. All headline models read from it without modifying it.
+panel_main <- apps_raw %>%
+  filter(
+    Domicile_named_country %in% c(eu_real, eu_synth),
+    Year %in% 2016:2025
+  ) %>%
+  mutate(
+    Domicile_named_country = as.character(Domicile_named_country),
+    Year       = as.integer(Year),
+    log_app    = log(Applicants),
+    EU         = as.integer(Domicile_named_country %in% eu_real),
+    Treated    = as.integer(Domicile_named_country %in% eu_real),
+    Post       = as.integer(Year >= 2021),     # post-Brexit
+    event_time = Year - 2020,                   # l = t - 2020
+    EU_group   = if_else(Domicile_named_country %in% eu_real,
+                         "Real_EU", "Synthetic_EU"),
+    # each treated country keeps its own label, all controls pooled as CONTROL
+    treated_factor = factor(if_else(Treated == 1,
+                                    Domicile_named_country, "CONTROL"))
+  ) %>%
+  left_join(regression_weights, by = "Domicile_named_country")
+
+# Every treated and synthetic country has a weight, so the join adds no NA.
+# Fail loudly if that assumption ever breaks.
+stopifnot(!anyNA(panel_main$regression_weight))
+stopifnot(
+  all(panel_main$Applicants > 0),
+  all(is.finite(panel_main$log_app)),
+  !anyDuplicated(panel_main[c("Domicile_named_country", "Year")]),
+  n_distinct(panel_main$Domicile_named_country) == 52L,
+  n_distinct(panel_main$Year) == 10L,
+  nrow(panel_main) == 520L
+)
+```
+
+```{r}
+# sanity checks
+print(unique(panel_main$Domicile_named_country))
+table(panel_main$EU_group)
+head(panel_main)
+```
+
+260/10 = 26 real European countries (excl. Ireland because it didn't face the same restrictions (-1) and excluding UK for obvious reasons (-1)) and 260/10 = 26 synthetic countries (including Ireland because it is the most plausible counter-factual).
+
+#For STATA replication
+
+```{r}
+#For stata replication checks
+#library(haven)
+#write_dta(
+#  panel_main %>%
+#    mutate(treated_factor = as.character(treated_factor)),
+#  "panel_main.dta"
+#)
+```
+
+
+# Saturated DID
+
+## S-DID design with DK errors
+
+This chunk estimates a pooled difference-in-differences model using `fixest::feols` with Driscoll–Kraay (DK) standard errors. `Post = 1` for years ≥ 2021 and treatment status `Treated = 1` for countries in `eu_real`. To allow heterogeneous post effects for each treated country while pooling all non-treated units, `treated_factor` gives each treated country its own label while all controls are set to `"CONTROL"` (the reference category).
+
+We estimate four specifications: a two-way fixed-effects model with country and year fixed effects (`m_sat_DK`), a country fixed-effects-only model (`m_sat_DK1`), a model without fixed effects (`m_sat_DK2`), all three weighted, and an unweighted two-way fixed-effects counterpart (`m_sat_DK3`). Model summaries are printed for comparison.
+
+The interaction term `i(treated_factor, Post, ref = "CONTROL")` estimates a separate post-treatment effect for each treated country relative to the pooled control group. Formally,
+
+$$
+\log(Applicants_{it}) =
+\alpha_i + \lambda_t +
+\sum_{c \in \mathcal{T}} \beta_c
+\left( \mathbf{1}\{i = c\} \times Post_t \right)
++ \varepsilon_{it},
+$$
+
+where $i$ indexes countries and $t$ indexes years, $\alpha_i$ and $\lambda_t$ denote country and year fixed effects, $\mathcal{T}$ is the set of treated (EU) countries, and $Post_t$ equals 1 for $t \geq 2021$.\
+Each coefficient $\beta_c$ captures the post-Brexit change in applications for treated country $c$ relative to the pooled control group.
+
+### Models
+
+```{r}
+library(fixest)
+
+m_sat_DK <- feols(
+  log_app ~ i(treated_factor, Post, ref = "CONTROL") |
+    Domicile_named_country + Year,
+  data = panel_main,
+  panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1),
+  weights = ~ regression_weight
+)
+
+m_sat_DK1 <- feols(
+  log_app ~ i(treated_factor, Post, ref = "CONTROL") |
+    Domicile_named_country,
+  data = panel_main,
+  panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1),
+  weights = ~ regression_weight
+)
+
+m_sat_DK2 <- feols(
+  log_app ~ i(treated_factor, Post, ref = "CONTROL"),
+  data = panel_main,
+  panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1),
+  weights = ~ regression_weight
+)
+
+# unweighted two-way FE counterpart of m_sat_DK
+m_sat_DK3 <- feols(
+  log_app ~ i(treated_factor, Post, ref = "CONTROL") |
+    Domicile_named_country + Year,
+  data = panel_main,
+  panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1)
+)
+
+
+```
+
+```{r}
+summary(m_sat_DK)
+summary(m_sat_DK1)
+summary(m_sat_DK2)
+summary(m_sat_DK3)
+```
+
+```{r eval=FALSE, include=FALSE}
+# summary(panel_main[, c(1,2,3,10,11,12)] %>% filter(Treated == 1))
+# summary(panel_main[, c(1,2,3,10,11,12)] %>% filter(Treated == 0))
+```
+
+```{r eval=FALSE, include=FALSE}
+# for STATA replication
+# library(haven)
+# panel_stata <- panel_main
+# panel_stata$ln_applicants <- panel_stata$log_app
+# write_dta(panel_stata, "BASELINE_REGRESSION_STATA_BATCH_1.dta")
+```
+
+## Event study
+
+This chunk estimates an event-study difference-in-differences model. Treatment status is $EU_i=1$ for countries in `eu_real`, and event time is $\ell = t - 2020$, so $\ell=0$ corresponds to 2020. `i(event_time, EU, ref = 0)` estimates a full set of dynamic EU–control differences for each relative year $\ell$, normalized to zero at $\ell=0$. Country and year fixed effects are included, standard errors are clustered, and `iplot()` visualizes the dynamic coefficients.
+
+$$
+\log(Applicants_{it})=\alpha_i+\lambda_t+\sum_{\ell\neq 0}\beta_{\ell}\Big(\mathbf{1}\{t-2020=\ell\}\times EU_i\Big)+\varepsilon_{it},
+$$
+
+where $\beta_{\ell}$ traces the dynamic EU–control difference in year $\ell$ relative to the baseline year $\ell=0$ (2020).
+
+### Event graph {#sec-event-graph}
+
+```{r}
+m_event <- feols(
+  log_app ~ i(event_time, EU, ref = 0) |
+    Domicile_named_country + Year,
+  data = panel_main,
+  panel.id = ~ Domicile_named_country + Year,
+  vcov = "cluster",
+  weights = ~ regression_weight
+)
+
+summary(m_event)
+
+iplot(
+  m_event,
+  xlab = "Years relative to 2020",
+  ylab = "Log difference in applications",
+  ref.line = 0,
+  main = "Event-study: EU vs synthetic control"
+)
+```
+
+```{r}
+# Joint pre-trend Wald test
+wald(m_event, c(
+  "event_time::-4:EU",
+  "event_time::-3:EU",
+  "event_time::-2:EU",
+  "event_time::-1:EU"
+))
+```
+
+For comparison, the following table uses iid standard errors:
+
+```{r}
+etable(m_event, vcov = "iid")
+```
+
+The iid standard errors are equal in this balanced specification because the residualized event-time indicators have identical support and second moments. In general, iid event-study standard errors need not be identical. With iid errors, the covariance matrix is
+
+$$
+\operatorname{Var}(\widehat{\boldsymbol\beta})=\sigma^2(X^{\prime}X)^{-1}.
+$$
+
+The equality here is a feature of this particular balanced design, not a general property of event studies.
+
+### Placebo graph
+
+This chunk implements a placebo event-study to test for spurious pre-treatment dynamics. A fake treatment year is set to 2018 and event time is $\ell = t - 2018$. `i(event_time_pl2018, EU, ref = -1)` normalizes the year immediately before the placebo treatment ($\ell=-1$) to zero. Standard errors are clustered at the country level.
+
+$$
+\log(Applicants_{it}) =
+\alpha_i + \lambda_t +
+\sum_{\ell \neq -1} \beta_{\ell}
+\left(\mathbf{1}\{t-2018=\ell\} \times EU_i\right)
++ \varepsilon_{it},
+$$
+
+where the coefficients $\beta_{\ell}$ capture placebo EU–control differences relative to the pre-placebo year $\ell=-1$.
+
+```{r}
+# placebo event time (fake Brexit in 2018), built on a derived column, no overwrite
+m_placebo_2018 <- feols(
+  log_app ~ i(I(Year - 2018), EU, ref = -1) |
+    Domicile_named_country + Year,
+  data = panel_main %>% filter(Year <= 2020),
+  panel.id = ~ Domicile_named_country + Year,
+  cluster = ~ Domicile_named_country,
+  weights = ~ regression_weight
+)
+
+summary(m_placebo_2018)
+
+iplot(
+  m_placebo_2018,
+  xlab = "Years relative to fake Brexit (2018)",
+  ylab = "Log difference in applications",
+  ref.line = 0,
+  main = "Placebo event study: fake Brexit in 2018"
+)
+```
+
+```{r}
+# leads-only sample (pre-2021 only)
+panel_pre <- panel_main %>% filter(Year < 2021)
+
+m_leads_only <- feols(
+  log_app ~ i(event_time, EU, ref = 0) |
+    Domicile_named_country + Year,
+  data = panel_pre,
+  panel.id = ~ Domicile_named_country + Year,
+  cluster = ~ Domicile_named_country,
+  weights = ~ regression_weight
+)
+
+summary(m_leads_only)
+
+iplot(
+  m_leads_only,
+  xlab = "Years relative to 2020",
+  ylab = "Log difference in applications",
+  ref.line = 0,
+  main = "Leads-only test without anticipation"
+)
+```
+
+```{r}
+wald(m_leads_only, c(
+  "event_time::-4:EU",
+  "event_time::-3:EU",
+  "event_time::-2:EU",
+  "event_time::-1:EU"
+))
+```
+
+## Saturated event study {#sec-saturated-event-study}
+
+```{r}
+# sanity checks on the treated_factor levels carried by panel_main
+levels(panel_main$treated_factor)
+length(levels(panel_main$treated_factor))
+```
+
+```{r}
+m_sat_event <- feols(
+  log_app ~ i(event_time, treated_factor, ref = 0, ref2 = "CONTROL") |
+    Domicile_named_country + Year,
+  data = panel_main,
+  panel.id = ~ Domicile_named_country + Year,
+  vcov = "cluster",
+  weights = ~ regression_weight
+)
+summary(m_sat_event)
+```
+
+```{r}
+library(broom)
+library(stringr)
+library(ggplot2)
+
+sat_event_plot <- broom::tidy(m_sat_event) %>%
+  filter(str_detect(term, "^event_time::")) %>%
+  mutate(
+    event_time = as.integer(str_extract(term, "-?\\d+(?=:)")),
+    country    = str_extract(term, "(?<=treated_factor::).*"),
+    conf.low   = estimate - 1.96 * std.error,
+    conf.high  = estimate + 1.96 * std.error
+  ) %>%
+  filter(!is.na(country), country != "CONTROL")
+
+ggplot(sat_event_plot, aes(x = event_time, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  geom_point(size = 1.6) +
+  geom_line() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.15) +
+  facet_wrap(~ country, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    x = "Years relative to 2020",
+    y = "Estimated log effect",
+    title = "Saturated DID event study by country"
+  )
+```
+
+## D-El from S-DID compared with mechanical and fee based {#sec-d-el-from-s-did-compared-with-mechanical-and-fee-based}
+
+```{r}
+library(ggplot2)
+library(broom)
+
+# 1. Brexit tuition shock. Two scalars, named for what they are:
+fee_pre  <- 9250
+fee_post <- 22200
+
+log_fee_change   <- log(fee_post) - log(fee_pre)        # log price change, about 0.875
+arith_fee_change <- (fee_post - fee_pre) / fee_pre      # arithmetic price change, about 1.40
+
+# 2. Elasticities from the saturated DiD regression
+decomp_did <- tidy(m_sat_DK, conf.int = TRUE) %>%
+  filter(grepl("^treated_factor::", term)) %>%
+  mutate(
+    country = gsub("^treated_factor::", "", term),
+    country = gsub(":Post$", "", country),
+
+    beta = estimate,                 # delta log Q (DiD semi-elasticity)
+
+    log_change    = beta,
+    conf_low_eta  = conf.low  / log_fee_change,
+    conf_high_eta = conf.high / log_fee_change,
+
+    eta_arc_did = (exp(beta) - 1) / arith_fee_change,   # arc elasticity
+    eta_log     = beta / log_fee_change                 # structural log elasticity
+  ) %>%
+  select(country, log_change, conf_low_eta, conf_high_eta, eta_arc_did, eta_log)
+
+# 3. Mechanical fee-based elasticity
+fee_df <- panel_main %>%
+  filter(Domicile_named_country %in% eu_real) %>%
+  group_by(Domicile_named_country) %>%
+  summarise(
+    app_pre  = mean(Applicants[Year == 2020], na.rm = TRUE),
+    app_post = mean(Applicants[Year == 2021], na.rm = TRUE),
+    eta_mechanical = ((app_post - app_pre) / app_pre) / arith_fee_change,
+    .groups = "drop"
+  ) %>%
+  rename(country = Domicile_named_country)
+
+# 4. Merge
+decomp_plot <- decomp_did %>%
+  left_join(fee_df, by = "country") %>%
+  arrange(eta_log) %>%
+  mutate(
+    country = factor(country, levels = country),
+    eta_arc_shift  = eta_arc_did + 0.04,    # small offsets so points don't overlap
+    eta_mech_shift = eta_mechanical + 0.08
+  )
+
+# 5. Plot
+ggplot(decomp_plot, aes(y = country)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70", linewidth = 0.35) +
+  geom_errorbarh(
+    aes(xmin = conf_low_eta, xmax = conf_high_eta),
+    height = 0.16, linewidth = 0.4, color = "grey45"
+  ) +
+  geom_segment(aes(x = eta_log, xend = eta_arc_shift, yend = country),
+               color = "grey80", linewidth = 0.3) +
+  geom_segment(aes(x = eta_arc_shift, xend = eta_mech_shift, yend = country),
+               color = "grey85", linewidth = 0.3) +
+  geom_point(aes(x = eta_log),        shape = 21, size = 2.8, fill = "#2C6DB2", color = "black", stroke = 0.25) +
+  geom_point(aes(x = eta_arc_shift),  shape = 21, size = 2.6, fill = "#8FBCE6", color = "black", stroke = 0.25) +
+  geom_point(aes(x = eta_mech_shift), shape = 21, size = 2.6, fill = "white",   color = "black", stroke = 0.25) +
+  labs(
+    title = "Decomposition of Post-Brexit Demand Elasticities",
+    subtitle = "Dark: structural log elasticity; Light: DiD arc elasticity; Hollow: fee-based elasticity",
+    x = "Demand elasticity",
+    y = "Country"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, margin = margin(b = 6)),
+    plot.subtitle = element_text(size = 11, margin = margin(b = 10)),
+    axis.text.y = element_text(size = 10),
+    axis.line = element_line(linewidth = 0.35),
+    plot.margin = margin(10, 12, 10, 10)
+  )
+```
+
+## Descriptive initial and later post-reform effects
+
+The period-split design needs a different `Post` window, so it gets its own frame without overwriting the baseline variable. `Post` flags 2021–2023 and `Post_COVID` flags 2024–2025. These are descriptive initial and later post-reform effects. The split does not separately identify a causal COVID component.
+
+```{r}
+panel_covid <- panel_main %>%
+  mutate(
+    Post       = as.integer(Year %in% c(2021, 2022, 2023)),
+    Post_COVID = as.integer(Year >= 2024)
+  )
+
+m_sat_DK_2 <- feols(
+  log_app ~
+    i(treated_factor, Post, ref = "CONTROL") +
+    i(treated_factor, Post_COVID, ref = "CONTROL") |
+    Domicile_named_country + Year,
+  data = panel_covid,
+  panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1),
+  weights = ~ regression_weight
+)
+
+summary(m_sat_DK_2)
+```
+
+```{r}
+library(tidyr)
+
+# 1) extract coefficients
+covid_coef <- tidy(m_sat_DK_2) %>%
+  filter(str_detect(term, "^treated_factor::")) %>%
+  mutate(
+    period = case_when(
+      str_detect(term, "Post_COVID$") ~ "Later 2024–2025",
+      str_detect(term, "Post$")       ~ "Initial 2021–2023",
+      TRUE ~ NA_character_
+    ),
+    country = term %>%
+      str_remove("^treated_factor::") %>%
+      str_remove(":(Post|Post_COVID)$"),
+    log_effect = estimate
+  ) %>%
+  filter(!is.na(period))
+
+# 2) wide version (for ordering + segments)
+covid_wide <- covid_coef %>%
+  select(country, period, log_effect) %>%
+  pivot_wider(names_from = period, values_from = log_effect) %>%
+  arrange(desc(`Later 2024–2025`)) %>%
+  mutate(country = factor(country, levels = unique(country)))
+
+# 3) long version (for legend + points)
+covid_long <- covid_wide %>%
+  pivot_longer(
+    cols = c(`Initial 2021–2023`, `Later 2024–2025`),
+    names_to = "period",
+    values_to = "log_effect"
+  ) %>%
+  mutate(
+    period = factor(
+      period,
+      levels = c("Initial 2021–2023", "Later 2024–2025")
+    )
+  )
+
+# 4) plot
+ggplot(covid_long, aes(y = country)) +
+  geom_segment(
+    data = covid_wide,
+    aes(x = `Initial 2021–2023`, xend = `Later 2024–2025`, yend = country),
+    color = "grey75", linewidth = 0.6
+  ) +
+  geom_point(aes(x = log_effect, color = period), size = 2.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70", linewidth = 0.35) +
+  scale_color_manual(values = c("#4C78A8", "#E45756"), name = NULL) +
+  labs(
+    title = "Country-specific post-reform log effects by period",
+    subtitle = "Initial 2021–2023 estimates and later 2024–2025 estimates",
+    x = "Log effect on applications",
+    y = ""
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11),
+    axis.text.y = element_text(size = 10),
+    legend.position = "top",
+    legend.text = element_text(size = 10)
+  )
+```
+
+# Robustness P.I
+
+## Step 1. Donor pools
+
+```{r}
+synth_poor <- c(
+  "Pakistan", "Nepal", "Bangladesh", "Ethiopia", "Uganda",
+  "Tanzania, United Republic of", "Rwanda", "Mozambique", "Malawi",
+  "Sierra Leone", "Ghana", "Nigeria", "Kenya", "Zimbabwe"
+)
+
+synth_rich <- c(
+  "United States of America", "Canada", "Australia", "Norway", "Switzerland",
+  "Singapore", "Qatar", "United Arab Emirates", "Kuwait", "Saudi Arabia",
+  "Israel", "Japan"
+)
+
+oecd <- c(
+  "Australia", "Canada", "Chile", "Colombia", "Iceland", "Israel", "Japan",
+  "Korea, Republic of", "Mexico", "New Zealand", "Norway", "Switzerland",
+  "Turkey", "United States of America"
+)
+```
+
+## Step 2. Analysis datasets
+
+```{r}
+data_baseline <- apps_clean %>%
+  filter(Domicile_named_country %in% c(eu_real, eu_synth)) %>%
+  mutate(control_group = "Baseline synthetic")
+
+data_poor <- apps_clean %>%
+  filter(Domicile_named_country %in% c(eu_real, synth_poor)) %>%
+  mutate(control_group = "Very poor controls")
+
+data_rich <- apps_clean %>%
+  filter(Domicile_named_country %in% c(eu_real, synth_rich)) %>%
+  mutate(control_group = "Very rich controls")
+
+data_oecd <- apps_clean %>%
+  filter(Domicile_named_country %in% c(eu_real, oecd)) %>%
+  mutate(control_group = "OECD controls")
+```
+
+### Basic checks
+
+```{r}
+check_data <- function(dat) {
+  data.frame(
+    observations      = nrow(dat),
+    countries         = length(unique(dat$Domicile_named_country)),
+    eu_countries      = length(unique(dat$Domicile_named_country[dat$EU == 1])),
+    control_countries = length(unique(dat$Domicile_named_country[dat$EU == 0])),
+    first_year        = min(dat$Year, na.rm = TRUE),
+    last_year         = max(dat$Year, na.rm = TRUE)
+  )
+}
+
+data_checks <- bind_rows(
+  "Baseline synthetic" = check_data(data_baseline),
+  "Very poor controls" = check_data(data_poor),
+  "Very rich controls" = check_data(data_rich),
+  "OECD controls"      = check_data(data_oecd),
+  .id = "sample"
+)
+
+data_checks
+```
+
+## Step 3. Construct donor-pool-specific weights
+
+```{r}
+make_distance_weights <- function(dat) {
+
+  pre_years <- 2016:2020
+
+  # Pre-treatment average EU trajectory
+  eu_pre <- dat %>%
+    filter(EU == 1, Year %in% pre_years) %>%
+    group_by(Year) %>%
+    summarise(eu_mean_log_app = mean(log_app), .groups = "drop")
+
+  stopifnot(identical(sort(eu_pre$Year), pre_years))
+
+  # Distance of each control country from the EU pre-treatment path
+  control_distances <- dat %>%
+    filter(EU == 0, Year %in% pre_years) %>%
+    select(Domicile_named_country, Year, log_app) %>%
+    left_join(eu_pre, by = "Year") %>%
+    group_by(Domicile_named_country) %>%
+    filter(n_distinct(Year) == length(pre_years), all(pre_years %in% Year)) %>%
+    summarise(
+      distance = sqrt(mean((log_app - eu_mean_log_app)^2)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      donor_weight = 1 / (distance + 0.001),
+      donor_weight = donor_weight / mean(donor_weight)
+    )
+
+  if (nrow(control_distances) != n_distinct(dat$Domicile_named_country[dat$EU == 0])) {
+    stop("A robustness donor lacks a complete five-year pre-treatment path.")
+  }
+
+  # Treated EU countries get weight 1, controls get distance-based donor weights.
+  out <- dat %>%
+    left_join(control_distances, by = "Domicile_named_country") %>%
+    mutate(
+      robustness_weight = if_else(EU == 1, 1, donor_weight)
+    )
+
+  if (anyNA(out$robustness_weight) || any(!is.finite(out$robustness_weight))) {
+    stop("Robustness weights are missing or non-finite.")
+  }
+
+  out
+}
+```
+
+```{r}
+data_baseline_w <- make_distance_weights(data_baseline)
+data_poor_w     <- make_distance_weights(data_poor)
+data_rich_w     <- make_distance_weights(data_rich)
+data_oecd_w     <- make_distance_weights(data_oecd)
+```
+
+## Step 4. Weighted and unweighted DiD models
+
+```{r}
+run_weighted_unweighted <- function(dat) {
+  m_weighted <- feols(
+    log_app ~ EU:Post | Domicile_named_country + Year,
+    data = dat,
+    weights = ~ robustness_weight,
+    panel.id = ~ Domicile_named_country + Year,
+    vcov = DK(1)
+  )
+  m_unweighted <- feols(
+    log_app ~ EU:Post | Domicile_named_country + Year,
+    data = dat,
+    panel.id = ~ Domicile_named_country + Year,
+    vcov = DK(1)
+  )
+  list(weighted = m_weighted, unweighted = m_unweighted)
+}
+```
+
+```{r}
+models_baseline <- run_weighted_unweighted(data_baseline_w)
+models_poor     <- run_weighted_unweighted(data_poor_w)
+models_rich     <- run_weighted_unweighted(data_rich_w)
+models_oecd     <- run_weighted_unweighted(data_oecd_w)
+```
+
+Next an Ireland-as-sole-control robustness check.
+
+```{r}
+eu_no_ireland <- setdiff(eu_real, "Ireland")  # eu_real has no Ireland, removed just in case
+
+panel_ireland_pooled <- apps_clean %>%
+  filter(Domicile_named_country %in% c(eu_no_ireland, "Ireland")) %>%
+  mutate(
+    EU   = as.integer(Domicile_named_country %in% eu_no_ireland),
+    Post = as.integer(Year >= 2021),
+    control_group = "IRELAND"
+  )
+
+m_ireland_only <- feols(
+  log_app ~ EU:Post | Domicile_named_country + Year,
+  data = panel_ireland_pooled,
+  panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1)
+)
+```
+
+```{r}
+# Robustness table
+etable(
+  models_baseline$weighted, models_baseline$unweighted,
+  models_poor$weighted,     models_poor$unweighted,
+  models_rich$weighted,     models_rich$unweighted,
+  models_oecd$weighted,     models_oecd$unweighted,
+  m_ireland_only,
+  dict = c("EU:Post" = "EU × Post"),
+  headers = c(
+    "Baseline weighted", "Baseline unweighted",
+    "Poor weighted", "Poor unweighted",
+    "Rich weighted", "Rich unweighted",
+    "OECD weighted", "OECD unweighted",
+    "Ireland only"
+  ),
+  fitstat = ~ n + ar2 + wr2,
+  tex = FALSE
+)
+```
+
+## Step 5. Plot basic DiD
+
+```{r}
+basic_models <- list(
+  "Baseline weighted"   = models_baseline$weighted,
+  "Baseline unweighted" = models_baseline$unweighted,
+  "Poor weighted"       = models_poor$weighted,
+  "Poor unweighted"     = models_poor$unweighted,
+  "Rich weighted"       = models_rich$weighted,
+  "Rich unweighted"     = models_rich$unweighted,
+  "OECD weighted"       = models_oecd$weighted,
+  "OECD unweighted"     = models_oecd$unweighted,
+  "Ireland only"        = m_ireland_only
+)
+
+basic_plot <- bind_rows(
+  lapply(names(basic_models), function(x) {
+    tidy(basic_models[[x]], conf.int = TRUE) %>%
+      filter(term == "EU:Post") %>%
+      mutate(model = x)
+  })
+) %>%
+  mutate(
+    model = factor(model, levels = rev(names(basic_models))),
+    group = case_when(
+      grepl("Baseline", model) ~ "Baseline",
+      grepl("Poor", model)     ~ "Poor",
+      grepl("Rich", model)     ~ "Rich",
+      grepl("OECD", model)     ~ "OECD",
+      grepl("Ireland", model)  ~ "Ireland",
+      TRUE ~ "Other"
+    )
+  )
+
+ggplot(basic_plot, aes(x = estimate, y = model, colour = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.18) +
+  geom_point(size = 2.7) +
+  scale_colour_manual(values = c(
+    "Baseline" = "#1F77B4", "Poor" = "#D62728", "Rich" = "#2CA02C",
+    "OECD" = "#9467BD", "Ireland" = "#FF7F0E"
+  )) +
+  labs(
+    title = "Robustness of the Brexit effect",
+    subtitle = "Pooled DiD estimates",
+    x = "Effect on log applicants",
+    y = NULL, colour = NULL,
+    caption = "Notes. Points are EU × Post coefficients. Lines are 95% confidence intervals."
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    axis.text = element_text(size = 9),
+    plot.caption = element_text(size = 8, hjust = 0)
+  )
+```
+
+# Robustness P.II
+
+## Step 1. Prepare the data
+
+```{r}
+prepare_saturated_data <- function(dat) {
+  dat %>%
+    mutate(
+      treated_factor = factor(case_when(
+        Domicile_named_country %in% eu_real ~ Domicile_named_country,
+        TRUE ~ "CONTROL"
+      ))
+    )
+}
+
+data_baseline_sat <- prepare_saturated_data(data_baseline_w)
+data_poor_sat     <- prepare_saturated_data(data_poor_w)
+data_rich_sat     <- prepare_saturated_data(data_rich_w)
+data_oecd_sat     <- prepare_saturated_data(data_oecd_w)
+```
+
+## Step 2. Run the saturated designs
+
+```{r}
+run_saturated_models <- function(dat) {
+  m_weighted <- feols(
+    log_app ~ i(treated_factor, Post, ref = "CONTROL") | Domicile_named_country + Year,
+    data = dat,
+    weights = ~ robustness_weight,
+    panel.id = ~ Domicile_named_country + Year,
+    vcov = DK(1)
+  )
+  m_unweighted <- feols(
+    log_app ~ i(treated_factor, Post, ref = "CONTROL") | Domicile_named_country + Year,
+    data = dat,
+    panel.id = ~ Domicile_named_country + Year,
+    vcov = DK(1)
+  )
+  list(weighted = m_weighted, unweighted = m_unweighted)
+}
+```
+
+```{r}
+sat_baseline <- run_saturated_models(data_baseline_sat)
+sat_poor     <- run_saturated_models(data_poor_sat)
+sat_rich     <- run_saturated_models(data_rich_sat)
+sat_oecd     <- run_saturated_models(data_oecd_sat)
+
+etable(sat_baseline, sat_poor, sat_rich, sat_oecd)
+```
+
+Saturated DID with Ireland as the only counterfactual. Weighting does not affect these coefficients, so it is left unweighted.
+
+```{r}
+panel_ireland <- apps_clean %>%
+  filter(Domicile_named_country %in% c(eu_real, "Ireland"))
+
+data_ireland_sat <- panel_ireland %>%
+  mutate(
+    treated_factor = factor(ifelse(
+      Domicile_named_country %in% eu_real,   # eu_real does not contain Ireland either way
+      Domicile_named_country,
+      "IRELAND"
+    )),
+    regression_weight = ifelse(Domicile_named_country == "Ireland", 26, 1)
+  )
+
+sat_ireland_only <- feols(
+  log_app ~ i(treated_factor, Post, ref = "IRELAND") | Domicile_named_country + Year,
+  data = data_ireland_sat,
+  panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1)
+)
+```
+
+```{r}
+etable(
+  sat_baseline$weighted, sat_baseline$unweighted,
+  sat_poor$weighted,     sat_poor$unweighted,
+  sat_rich$weighted,     sat_rich$unweighted,
+  sat_oecd$weighted,     sat_oecd$unweighted,
+  sat_ireland_only,
+  headers = c(
+    "Baseline weighted", "Baseline unweighted",
+    "Poor weighted", "Poor unweighted",
+    "Rich weighted", "Rich unweighted",
+    "OECD weighted", "OECD unweighted",
+    "Ireland only"
+  ),
+  fitstat = ~ n + ar2 + wr2,
+  tex = FALSE
+)
+```
+
+## Step 3. Line plot comparing models
+
+```{r}
+library(ggrepel)
+
+sat_models <- list(
+  "Baseline W" = sat_baseline$weighted, "Baseline U" = sat_baseline$unweighted,
+  "Poor W" = sat_poor$weighted,         "Poor U" = sat_poor$unweighted,
+  "Rich W" = sat_rich$weighted,         "Rich U" = sat_rich$unweighted,
+  "OECD W" = sat_oecd$weighted,         "OECD U" = sat_oecd$unweighted,
+  "Ireland" = sat_ireland_only
+)
+
+sat_long <- bind_rows(lapply(names(sat_models), function(m) {
+  tidy(sat_models[[m]], conf.int = TRUE) %>%
+    filter(str_detect(term, "treated_factor::.*:Post")) %>%
+    mutate(
+      model = m,
+      country = str_replace_all(term, "treated_factor::|:Post", "")
+    )
+}))
+
+sat_long$model <- factor(sat_long$model, levels = names(sat_models))
+
+ranked <- sat_long %>%
+  group_by(country) %>%
+  summarise(avg = mean(estimate), .groups = "drop") %>%
+  arrange(avg)
+
+low  <- ranked$country[1]
+high <- ranked$country[nrow(ranked)]
+
+sat_long <- sat_long %>%
+  mutate(group = case_when(
+    country == low  ~ "Lowest",
+    country == high ~ "Highest",
+    TRUE ~ "Other"
+  ))
+
+avg <- sat_long %>%
+  group_by(model) %>%
+  summarise(estimate = mean(estimate), .groups = "drop") %>%
+  mutate(country = "AVERAGE", group = "Average")
+
+labels <- bind_rows(
+  sat_long %>% filter(country %in% c(low, high), model == "Ireland"),
+  avg %>% filter(model == "Ireland")
+)
+
+ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_line(data = sat_long %>% filter(group == "Other"),
+            aes(model, estimate, group = country), colour = "grey75", alpha = 0.5) +
+  geom_line(data = sat_long %>% filter(group != "Other"),
+            aes(model, estimate, group = country, colour = group), linewidth = 1.3) +
+  geom_line(data = avg, aes(model, estimate, group = country, colour = group), linewidth = 1.5) +
+  geom_point(data = sat_long %>% filter(group != "Other"),
+             aes(model, estimate, colour = group), size = 2.4) +
+  geom_point(data = avg, aes(model, estimate, colour = group), size = 2.6) +
+  geom_text_repel(data = labels, aes(model, estimate, label = country, colour = group),
+                  nudge_x = 0.4, hjust = 0, show.legend = FALSE) +
+  scale_colour_manual(values = c("Lowest" = "#8B0000", "Highest" = "#2166AC", "Average" = "black")) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "Saturated DiD robustness",
+    subtitle = "Lowest, highest, and average trajectories",
+    x = NULL, y = "Effect on log applicants", colour = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    plot.margin = margin(10, 80, 10, 10)
+  )
+```
+
+# Controls for wealth heterogeneity
+
+The wealth-heterogeneity panel is derived directly from `panel_main`, so it inherits `log_app`, `EU`, `Post`, and `regression_weight` without recomputation. We add the DiD interaction and merge in World Bank controls.
+
+```{r}
+panel_wb <- panel_main %>%
+  mutate(did = EU * Post) %>%
+  filter(!is.na(log_app))
+```
+
+Now a targeted pull from the World Bank API for:
+
+  - GDP per capita at purchasing-power parity in constant 2021 international dollars
+  - Population aged 15 to 64
+  - Youth unemployment
+  - Government expenditure on education (% of GDP)
+
+QS-ranked university counts are deliberately not pulled here, since the World Bank exposes no such series. That one stays a manual table for future work.
+
+```{r}
+library(WDI)
+library(countrycode)
+
+panel_countries <- unique(panel_wb$Domicile_named_country)
+
+iso_map <- data.frame(Domicile_named_country = panel_countries) %>%
+  mutate(
+    iso2c = countrycode(
+      Domicile_named_country, "country.name", "iso2c",
+      custom_match = c("Cyprus (European Union)" = "CY"),
+      warn = TRUE
+    ),
+    iso3c = countrycode(iso2c, "iso2c", "iso3c", warn = FALSE)
+  )
+
+# safety net, this should print zero rows
+iso_map[is.na(iso_map$iso2c), ]
+```
+
+```{r}
+wb_codes <- c(
+  GDPpc       = "NY.GDP.PCAP.PP.KD", # GDP per capita, PPP, constant 2021 international dollars
+  Pop15_64    = "SP.POP.1564.TO",    # population ages 15-64, total
+  YouthUnempl = "SL.UEM.1524.ZS",    # unemployment, ages 15-24, modeled ILO
+  EduSpendGDP = "SE.XPD.TOTL.GD.ZS"  # govt expenditure on education, % of GDP
+)
+
+stopifnot(identical(unname(wb_codes[["GDPpc"]]), "NY.GDP.PCAP.PP.KD"))
+
+# Cache the exact response used in the regressions. Set REFRESH_WDI=true only
+# when intentionally updating the World Bank vintage, then rerun the audit.
+wb_cache_file <- "wb_snapshot_2016_2024.rds"
+refresh_wdi <- identical(tolower(Sys.getenv("REFRESH_WDI", "false")), "true")
+
+if (file.exists(wb_cache_file) && !refresh_wdi) {
+  wb_raw <- readRDS(wb_cache_file)
+} else {
+  wb_raw <- WDI(
+    country   = na.omit(iso_map$iso2c),
+    indicator = wb_codes,
+    start     = 2016,
+    end       = 2024
+  )
+  saveRDS(wb_raw, wb_cache_file)
+}
+
+stopifnot(all(c("iso3c", "year", names(wb_codes)) %in% names(wb_raw)))
+
+
+# Lebanon is missing GDP per capita and youth unemployment for 2024 in the
+# manuscript vintage. Impute only those two cells from 2022 and 2023.
+impute_lbn_2024 <- function(x, variable) {
+  target <- x$iso3c == "LBN" & x$year == 2024
+  source <- x$iso3c == "LBN" & x$year %in% c(2022, 2023)
+  stopifnot(sum(target) == 1L, sum(source) == 2L)
+  if (is.na(x[[variable]][target])) {
+    stopifnot(all(is.finite(x[[variable]][source])))
+    x[[variable]][target] <- mean(x[[variable]][source])
+  }
+  x
+}
+
+wb_raw <- impute_lbn_2024(wb_raw, "GDPpc")
+wb_raw <- impute_lbn_2024(wb_raw, "YouthUnempl")
+
+wb_clean <- wb_raw %>%
+  transmute(iso3c, Year = as.integer(year),
+            GDPpc, Pop15_64, YouthUnempl, EduSpendGDP)
+
+```
+
+```{r}
+panel_wb <- panel_wb %>%
+  left_join(iso_map[, c("Domicile_named_country", "iso3c")],
+            by = "Domicile_named_country") %>%
+  left_join(wb_clean, by = c("iso3c", "Year"))
+
+# Complete-case on the THREE controls the models consume. Education spend rides
+# along but does NOT gate the sample (it is sparse for recent years and the Gulf).
+panel_wb <- panel_wb %>%
+  filter(!is.na(GDPpc), !is.na(Pop15_64), !is.na(YouthUnempl))
+```
+
+```{r}
+# Quick inspection of the data in Excel
+library(openxlsx)
+write.xlsx(panel_wb, "panel_wb.xlsx", overwrite = TRUE)
+```
+
+Centre the three controls once. Centring is done on the log (for GDP and population), so models must reference the bare `c_*` variables and never wrap `log()` around them again.
+
+```{r}
+library(modelsummary)
+
+panel_wb <- panel_wb %>%
+  mutate(
+    c_log_GDPpc    = log(GDPpc)    - mean(log(GDPpc),    na.rm = TRUE),
+    c_log_Pop15_64 = log(Pop15_64) - mean(log(Pop15_64), na.rm = TRUE),
+    c_YouthUnempl  = YouthUnempl   - mean(YouthUnempl,   na.rm = TRUE))
+
+stopifnot(all(panel_wb$GDPpc > 0), all(panel_wb$Pop15_64 > 0))
+
+# M1 — clean baseline DiD
+m1 <- feols(
+  log_app ~ Treated:Post | Domicile_named_country + Year,
+  data = panel_main, panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1), weights = ~ regression_weight
+)
+
+# M2 — add GDP
+m2 <- feols(
+  log_app ~ did + c_log_GDPpc | Domicile_named_country + Year,
+  data = panel_wb, panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1), weights = ~ regression_weight
+)
+
+# M4 — add working-age population
+m4 <- feols(
+  log_app ~ did + c_log_GDPpc + c_log_Pop15_64 | Domicile_named_country + Year,
+  data = panel_wb, panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1), weights = ~ regression_weight
+)
+
+# M5 — add youth unemployment
+m5 <- feols(
+  log_app ~ did + c_log_GDPpc + c_YouthUnempl + c_log_Pop15_64 | Domicile_named_country + Year,
+  data = panel_wb, panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1), weights = ~ regression_weight
+)
+
+# M6 — fully interacted structural channels
+m6 <- feols(
+  log_app ~ did * (c_log_GDPpc + c_log_Pop15_64 + c_YouthUnempl) | Domicile_named_country + Year,
+  data = panel_wb, panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1), weights = ~ regression_weight
+)
+
+modelsummary(
+  list("M1" = m1, "M2" = m2, "M4" = m4, "M5" = m5, "M6" = m6),
+  stars = TRUE, output = "default"
+)
+```
+
+```{r}
+wald(m6, c("did:c_log_GDPpc", "did:c_log_Pop15_64", "did:c_YouthUnempl"))
+```
+
+The two-way fixed-effects estimates indicate a large contraction in EU applications following the 2021 fee reform. The baseline specification places the effect at -1.109, and the fully controlled additive model (M5) estimates -0.961. Translated into levels, the latter corresponds to a decline of approximately 62%. The stability of the estimate after adding the controls is evidence against those observed covariates explaining the baseline result.
+
+The fully interacted specification (M6) allows the treatment effect to vary with these structural characteristics. In the manuscript table, its ATT is -1.211 and the interactions with GDP per capita, working-age population, and youth unemployment are 0.808, 0.100, and 0.011. The first two are positive and precisely estimated, while the youth-unemployment interaction is not statistically distinguishable from zero. These are conditional associations and should not be read as separate causal mechanisms.
+
+## Saturated controls (S1–S4)
+
+```{r}
+panel_wb_sat <- panel_wb %>%
+  mutate(
+    treated_factor = factor(ifelse(
+      Domicile_named_country %in% eu_real, Domicile_named_country, "CONTROL"
+    ))
+  ) %>%
+  filter(!is.na(log_app), !is.na(Post), !is.na(treated_factor))
+```
+
+```{r}
+# S1: saturated DiD only
+s1 <- feols(
+  log_app ~ i(treated_factor, Post, ref = "CONTROL") | Domicile_named_country + Year,
+  data = panel_wb_sat, panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1), weights = ~ regression_weight
+)
+
+# S2: add GDP
+s2 <- feols(
+  log_app ~ i(treated_factor, Post, ref = "CONTROL") + c_log_GDPpc | Domicile_named_country + Year,
+  data = panel_wb_sat, panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1), weights = ~ regression_weight
+)
+
+# S3: add GDP + working-age population
+s3 <- feols(
+  log_app ~ i(treated_factor, Post, ref = "CONTROL") + c_log_GDPpc + c_log_Pop15_64 | Domicile_named_country + Year,
+  data = panel_wb_sat, panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1), weights = ~ regression_weight
+)
+
+# S4: add GDP + working-age population + youth unemployment
+# (weighted, like S1-S3, so the table is a like-for-like comparison)
+s4 <- feols(
+  log_app ~ i(treated_factor, Post, ref = "CONTROL") + c_log_GDPpc + c_log_Pop15_64 + c_YouthUnempl | Domicile_named_country + Year,
+  data = panel_wb_sat, panel.id = ~ Domicile_named_country + Year,
+  vcov = DK(1), weights = ~ regression_weight
+)
+
+modelsummary(
+  list(
+    "S1 Saturated DiD" = s1,
+    "S2 + GDPpc" = s2,
+    "S3 + GDPpc + Pop" = s3,
+    "S4 + GDPpc + Pop + YouthUnempl" = s4
+  ),
+  stars = TRUE, output = "default"
+)
+```
+
+```{r}
+#summary(s4)
+```
+
+
+## Plot saturated effects {#sec-plot-saturated-effects}
+
+```{r}
+library(purrr)
+
+# Reuse the fee scalars defined earlier. Structural elasticity divides the
+# country effect by the LOG fee change (about 0.875).
+elas_models <- list(
+  "S1: No controls" = s1,
+  "S2: + GDPpc" = s2,
+  "S3: + GDPpc + Pop" = s3,
+  "S4: + GDPpc + Pop + YouthUnempl" = s4
+)
+
+elas_coef <- imap_dfr(elas_models, function(mod, mod_name) {
+  tidy(mod, conf.int = TRUE) %>%
+    mutate(model = mod_name, term = as.character(term)) %>%
+    filter(str_detect(term, "treated_factor")) %>%
+    mutate(
+      country = term %>%
+        str_remove(".*treated_factor::") %>%
+        str_remove("[#:]Post.*")
+    ) %>%
+    filter(country != "CONTROL") %>%
+    mutate(
+      elasticity = estimate  / log_fee_change,
+      elas_low   = conf.low  / log_fee_change,
+      elas_high  = conf.high / log_fee_change
+    )
+})
+
+country_order <- elas_coef %>%
+  filter(model == "S4: + GDPpc + Pop + YouthUnempl") %>%
+  arrange(elasticity) %>%
+  pull(country)
+
+elas_plot <- elas_coef %>%
+  mutate(
+    country = factor(country, levels = country_order),
+    model = factor(model, levels = c(
+      "S1: No controls", "S2: + GDPpc",
+      "S3: + GDPpc + Pop", "S4: + GDPpc + Pop + YouthUnempl"
+    ))
+  )
+
+ggplot(elas_plot, aes(x = elasticity, y = country, color = model, group = country)) +
+  geom_line(color = "grey75", linewidth = 0.5) +
+  geom_errorbarh(aes(xmin = elas_low, xmax = elas_high),
+                 height = 0.12, linewidth = 0.5, alpha = 0.85) +
+  geom_point(size = 2.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70", linewidth = 0.35) +
+  scale_color_manual(values = c(
+    "S1: No controls" = "#4C78A8",
+    "S2: + GDPpc" = "#72B7B2",
+    "S3: + GDPpc + Pop" = "#F2CF5B",
+    "S4: + GDPpc + Pop + YouthUnempl" = "#E45756"
+  ), name = NULL) +
+  labs(
+    title = "Country-Specific Demand Elasticities Across Saturated DiD Specifications",
+    subtitle = "Country-specific post-2021 effects rescaled by the tuition fee increase",
+    x = "Implied demand elasticity",
+    y = ""
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11),
+    axis.text.y = element_text(size = 10),
+    legend.position = "top",
+    legend.text = element_text(size = 10)
+  )
+```
+
+#Models for step 3
+
+```{r}
+library(broom)
+library(openxlsx)
+
+# The five columns of Online Appendix Table A1, in the same order.
+model_list <- list(
+  weighted_country_year_FE       = m_sat_DK,
+  weighted_country_FE            = m_sat_DK1,
+  weighted_no_FE                 = m_sat_DK2,
+  weighted_country_year_controls = s4,
+  unweighted_country_year_FE     = m_sat_DK3
+)
+
+wb <- createWorkbook()
+
+for (nm in names(model_list)) {
+  tab <- tidy(model_list[[nm]], conf.int = TRUE)
+  addWorksheet(wb, nm)
+  writeData(wb, nm, tab)
+}
+
+saveWorkbook(wb, "saturated_models.xlsx", overwrite = TRUE)
+
+extract_country_effects <- function(model, value_name) {
+  out <- tidy(model) %>%
+    filter(grepl("^treated_factor::.*:Post$", term)) %>%
+    transmute(
+      Country = sub(":Post$", "", sub("^treated_factor::", "", term)),
+      value = estimate
+    )
+  names(out)[names(out) == "value"] <- value_name
+  out
+}
+
+betas_saturated_model <- extract_country_effects(m_sat_DK, "Estimate_TWFE") %>%
+  full_join(extract_country_effects(s4, "Estimate_controls"), by = "Country") %>%
+  full_join(extract_country_effects(m_sat_DK2, "Estimate_Pooled"), by = "Country") %>%
+  mutate(
+    iso2c = countrycode(
+      Country, "country.name", "iso2c",
+      custom_match = c("Cyprus (European Union)" = "CY"),
+      warn = TRUE
+    )
+  ) %>%
+  select(iso2c, Country, Estimate_TWFE, Estimate_controls, Estimate_Pooled)
+
+stopifnot(
+  nrow(betas_saturated_model) == length(eu_real),
+  !anyNA(betas_saturated_model[, c("iso2c", "Estimate_TWFE", "Estimate_controls", "Estimate_Pooled")])
+)
+
+write.xlsx(
+  list(main = betas_saturated_model),
+  "betas_saturated_model.xlsx",
+  overwrite = TRUE
+)
+```
+
+# Descriptives
+
+```{r}
+library(psych)
+library(openxlsx)
+
+main_vars <- c(
+  "Applicants",
+  "log_app",
+  "EU",
+  "Post",
+  "event_time",
+  "regression_weight"
+)
+
+wb_vars <- c(
+  "Applicants",
+  "log_app",
+  "EU",
+  "Post",
+  "did",
+  "event_time",
+  "regression_weight",
+  "GDPpc",
+  "Pop15_64",
+  "YouthUnempl",
+  "EduSpendGDP",
+  "c_log_GDPpc",
+  "c_log_Pop15_64",
+  "c_YouthUnempl"
+)
+
+desc_main <- psych::describe(
+  panel_main[, intersect(main_vars, names(panel_main))],
+  fast = FALSE
+)
+
+desc_wb <- psych::describe(
+  panel_wb[, intersect(wb_vars, names(panel_wb))],
+  fast = FALSE
+)
+
+desc_main <- data.frame(
+  Variable = rownames(desc_main),
+  desc_main,
+  row.names = NULL
+)
+
+desc_wb <- data.frame(
+  Variable = rownames(desc_wb),
+  desc_wb,
+  row.names = NULL
+)
+
+openxlsx::write.xlsx(
+  list(
+    panel_main = desc_main,
+    panel_wb = desc_wb
+  ),
+  "compact_descriptives.xlsx",
+  overwrite = TRUE
+)
+```
+
+
+# Standalone synthetic difference-in-differences on the full donor pool
+
+This section stands apart from the rest of the manuscript. It does not feed any headline number and it ignores the curated synthetic control weights used earlier. The point is narrow. It asks what a single synthetic difference-in-differences estimate looks like when every non-EU country in the cleaned file is thrown into the donor pool at once, with no hand-picked controls and no regression weighting. The estimator follows Arkhangelsky et al. (2021) and runs through the synthdid package, which blends synthetic control unit weights with difference-in-differences time weights in one step.
+
+Use synthdid version 0.0.9, the version audited for this file, or record and review any later version before updating the results.
+
+
+The estimator needs three things. A balanced panel where every unit appears in every year, one common adoption date shared by all treated units, and a clean 0/1 treatment indicator that switches on for treated units in treated years. The EU block all move together in 2021, so the block design holds. We start from apps_clean, drop any country whose applicant count hits zero in some year (its log outcome is not finite), then keep only countries observed in every year so the panel is balanced.
+
+```{r}
+library(synthdid)
+library(dplyr)
+
+# Years included in the analysis
+all_years <- sort(unique(apps_clean$Year))
+n_years <- length(all_years)
+stopifnot(identical(all_years, 2016:2025))
+stopifnot(!any(apps_clean$Domicile_named_country %in% non_countries))
+
+# Construct one observation per country and year
+sdid_long <- apps_clean %>%
+  select(
+    Domicile_named_country,
+    Year,
+    log_app,
+    EU
+  ) %>%
+  filter(
+    !is.na(Domicile_named_country),
+    !is.na(Year),
+    !is.na(EU)
+  ) %>%
+  group_by(Domicile_named_country, Year) %>%
+  summarise(
+    log_app = mean(log_app),
+    EU = first(EU),
+    n_EU_values = n_distinct(EU),
+    .groups = "drop"
+  )
+
+# Stop if the same country has conflicting EU classifications
+stopifnot(all(sdid_long$n_EU_values == 1))
+
+sdid_long <- sdid_long %>%
+  select(-n_EU_values)
+
+# Remove any country with a non-finite outcome in at least one year
+bad_countries <- sdid_long %>%
+  group_by(Domicile_named_country) %>%
+  summarise(
+    bad_outcome = any(!is.finite(log_app)),
+    .groups = "drop"
+  ) %>%
+  filter(bad_outcome) %>%
+  pull(Domicile_named_country)
+
+sdid_long <- sdid_long %>%
+  filter(!Domicile_named_country %in% bad_countries)
+
+# Keep only countries observed exactly once in every analysis year
+sdid_long <- sdid_long %>%
+  group_by(Domicile_named_country) %>%
+  filter(
+    n() == n_years,
+    n_distinct(Year) == n_years,
+    all(all_years %in% Year)
+  ) %>%
+  ungroup()
+
+# Treatment starts for EU countries in 2021
+sdid_long <- sdid_long %>%
+  mutate(
+    treated = as.integer(EU == 1 & Year >= 2021)
+  ) %>%
+  arrange(Domicile_named_country, Year)
+
+# Strict balance checks
+stopifnot(
+  !anyDuplicated(
+    sdid_long[c("Domicile_named_country", "Year")]
+  )
+)
+
+stopifnot(
+  nrow(sdid_long) ==
+    n_distinct(sdid_long$Domicile_named_country) *
+    n_distinct(sdid_long$Year)
+)
+
+stopifnot(
+  all(is.finite(sdid_long$log_app))
+)
+
+# Sanity checks
+n_distinct(
+  sdid_long$Domicile_named_country[sdid_long$EU == 0]
+)
+
+n_distinct(
+  sdid_long$Domicile_named_country[sdid_long$EU == 1]
+)
+
+range(sdid_long$Year)
+
+sdid_long %>%
+  count(Domicile_named_country) %>%
+  summarise(
+    minimum_years = min(n),
+    maximum_years = max(n)
+  )
+
+# Hand the long panel to panel.matrices, which reshapes it into the wide
+# outcome matrix and reports the number of controls and pre-periods.
+setup <- panel.matrices(
+  as.data.frame(sdid_long),
+  unit      = "Domicile_named_country",
+  time      = "Year",
+  outcome   = "log_app",
+  treatment = "treated"
+)
+
+# how many donors and how many pre-periods the estimator is working with
+setup$N0
+setup$T0
+```
+
+The estimate is one line. Standard errors come from the jackknife, which is the right choice here because the treated group holds many units. The placebo variant shown in the package documentation is meant for the single treated unit case and does not apply.
+
+```{r}
+tau_hat <- synthdid_estimate(setup$Y, setup$N0, setup$T0)
+
+se <- sqrt(vcov(tau_hat, method = "jackknife"))
+
+summary(tau_hat)
+
+  sprintf("point estimate %.3f", as.numeric(tau_hat))
+
+  sprintf("95%% CI (%.3f, %.3f)", tau_hat - 1.96 * se, tau_hat + 1.96 * se)
+  
+```
+
+The plot overlays the treated EU trajectory against its synthetic counterpart and marks the pre-period time weights along the bottom.
+
+```{r}
+plot(tau_hat)
+```
+
+The coefficient is on the log applicant scale and applies to total UCAS applicants in the file, not postgraduate applicants alone. Treat it as a donor-pool stress test. Agreement in sign and rough magnitude is supportive evidence, but it does not by itself eliminate all donor-selection concerns.
+
+## Per-country saturated synthetic difference-in-differences
+
+The pooled run above treats the whole EU block as one unit. The saturated design does not. It gives every EU country its own post-Brexit coefficient. We can match that structure inside synthetic difference-in-differences by running the estimator one treated country at a time, which is the single-treated-unit case in Arkhangelsky et al. (2021). Each EU country is treated alone against the same shared pool of non-EU donors, so it earns its own synthetic control and its own time weights instead of borrowing a set tuned to the treated average. The result is a per-country effect that lines up one to one with the saturated `beta_j`.
+
+We reuse `sdid_long`, which is already balanced and cleaned. For each treated country we keep that country plus every non-EU donor, flip the treatment on for that country from 2021, and read off the point estimate. We collect point estimates only. Per-country standard errors would need the placebo or bootstrap variance rather than the jackknife, since the jackknife needs at least two treated units.
+
+```{r}
+# EU countries that survived the balance filter
+eu_countries <- sort(unique(sdid_long$Domicile_named_country[sdid_long$EU == 1]))
+
+# one synthdid run per treated country against the shared non-EU donor pool
+sdid_by_country <- sapply(eu_countries, function(j) {
+  panel_j <- sdid_long %>%
+    filter(Domicile_named_country == j | EU == 0) %>%
+    mutate(treated_j = as.integer(Domicile_named_country == j & Year >= 2021))
+
+  setup_j <- panel.matrices(
+    as.data.frame(panel_j),
+    unit      = "Domicile_named_country",
+    time      = "Year",
+    outcome   = "log_app",
+    treatment = "treated_j"
+  )
+
+  as.numeric(synthdid_estimate(setup_j$Y, setup_j$N0, setup_j$T0))
+})
+
+sdid_by_country
+```
+
+## Saturated TWFE versus synthetic difference-in-differences
+
+Now line the two sets of country coefficients up in one table. The saturated two-way fixed-effects effects come from `m_sat_DK`, and the synthetic difference-in-differences effects come from the per-country loop above. Both sit on the log applicant scale, so the columns are directly comparable, and the difference column flags any country where the mechanically chosen synthetic control disagrees with the pooled year fixed effect.
+
+```{r}
+library(broom)
+library(knitr)
+
+# saturated TWFE coefficients, one per treated country
+sat_twfe <- tidy(m_sat_DK) %>%
+  filter(grepl("^treated_factor::", term)) %>%
+  transmute(
+    country = gsub(":Post$", "", gsub("^treated_factor::", "", term)),
+    beta_saturated_twfe = estimate
+  )
+
+# per-country synthetic difference-in-differences estimates
+sdid_tab <- tibble(
+  country = names(sdid_by_country),
+  beta_synthetic_did = as.numeric(sdid_by_country)
+)
+
+# compare
+comparison <- sat_twfe %>%
+  left_join(sdid_tab, by = "country") %>%
+  mutate(difference = beta_saturated_twfe - beta_synthetic_did) %>%
+  arrange(beta_saturated_twfe)
+
+kable(comparison, digits = 3,
+      col.names = c("Country", "Saturated TWFE", "Synthetic DiD", "Difference"))
+
+comparison_summary <- comparison %>%
+  summarise(
+    correlation = cor(beta_saturated_twfe, beta_synthetic_did),
+    mean_absolute_difference = mean(abs(difference)),
+    largest_absolute_difference = max(abs(difference))
+  )
+
+comparison_summary
+write.csv(comparison, "table5_synthetic_did_comparison.csv", row.names = FALSE)
+```
+
+The corrected donor pool yields a correlation of about 0.978 and a mean absolute difference of about 0.163 log points. Portugal has the largest absolute discrepancy at about 0.418 log points. The designs agree closely on the ranking, although their level differences remain economically relevant for several countries.
+
+
+## Reference
+
+Arkhangelsky, D., Athey, S., Hirshberg, D. A., Imbens, G. W., & Wager, S. (2021). Synthetic difference-in-differences. American Economic Review, 111(12), 4088–4118. https://doi.org/10.1257/aer.20190159
+
+
+
+# Bonus. Rambachan-Roth parallel-trends sensitivity
+
+This standalone section checks how robust the event study is to violations of parallel trends using Rambachan and Roth (2023). A passed pre-trend Wald test does not by itself settle that concern (Roth, 2022). The code reuses the country-clustered event-study model estimated above.
+
+## Rambachan-Roth sensitivity with HonestDiD
+
+HonestDiD lives on GitHub, so it needs a one-time install like synthdid.
+
+```{r eval=FALSE}
+remotes::install_github("asheshrambachan/HonestDiD")
+```
+
+We hand the fitted event study to HonestDiD. The only glue is pulling the dynamic EU coefficients out of `m_event` and counting how many are pre-period leads and post-period lags. The package does the rest and returns robust confidence sets as the allowed violation grows.
+
+```{r}
+library(HonestDiD)
+
+b   <- coef(m_event)
+V   <- vcov(m_event)
+idx <- grep("event_time::-?[0-9]+:EU", names(b))
+ev  <- as.integer(sub("event_time::(-?[0-9]+):EU", "\\1", names(b)[idx]))
+idx <- idx[order(ev)]
+ev  <- sort(ev)
+
+sens <- createSensitivityResults_relativeMagnitudes(
+  betahat        = b[idx],
+  sigma          = V[idx, idx],
+  numPrePeriods  = sum(ev < 0),
+  numPostPeriods = sum(ev > 0),
+  Mbarvec        = seq(0, 2, by = 0.5)
+)
+
+orig <- constructOriginalCS(
+  betahat        = b[idx],
+  sigma          = V[idx, idx],
+  numPrePeriods  = sum(ev < 0),
+  numPostPeriods = sum(ev > 0)
+)
+
+sens
+createSensitivityPlot_relativeMagnitudes(sens, orig)
+```
+
+The breakdown value is the Mbar at which the robust confidence set first includes zero. A value above one means the effect survives a post-treatment trend violation as large as the worst violation already visible in the pre-periods.
+
+
+## Reference
+
+Rambachan, A., & Roth, J. (2023). A more credible approach to parallel trends. The Review of Economic Studies, 90(5), 2555–2591. https://doi.org/10.1093/restud/rdad018
+
+Roth, J. (2022). Pretest with caution: Event-study estimates after testing for parallel trends. American Economic Review: Insights, 4(3), 305–322. https://doi.org/10.1257/aeri.20210236
+
+## Reproducibility record
+
+```{r session-info}
+sessionInfo()
+```

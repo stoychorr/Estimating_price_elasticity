@@ -6,9 +6,16 @@ output: html_document
 This file contains only the calculations needed for the subjective-discount
 exercise and the two figures used in the paper.
 
-The treated sample contains EU countries other than Ireland. The loan
-thresholds are the official 2021-22 Plan 2 overseas thresholds. Wages are
-converted from euros to pounds using the official rate of 0.885798.
+The treated sample contains EU countries other than Ireland. A student entering
+in 2021 completes a standard three-year programme in 2024 and becomes liable to
+repay from April 2025. The loan thresholds are therefore the official 2025-26
+Plan 2 overseas thresholds, applicable from April 2025 to March 2026. Observed
+2024 wages are converted from euros to pounds using the official 2025-26 SLC
+rate of 0.848248 and grown once at the assumed 2% rate to obtain earnings in the
+first repayment year.
+
+Official source
+https://www.gov.uk/government/publications/overseas-earnings-thresholds-for-plan-2-student-loans/overseas-earnings-thresholds-for-plan-2-student-loans-2024-25
 
 ```{r setup, message=FALSE, warning=FALSE}
 library(readxl)
@@ -19,14 +26,17 @@ loan_amount <- 9250
 post_brexit_price <- 22200
 repayment_rate <- 0.09
 wage_growth <- 0.02
+years_to_first_repayment <- 1
 rpi <- 0.043
 interest_spread <- 0.03
-eur_gbp <- 0.885798
+eur_gbp <- 0.848248
 ```
 
 # Data
 
 ```{r thresholds}
+# https://www.gov.uk/government/publications/overseas-earnings-thresholds-for-plan-2-student-loans/overseas-earnings-thresholds-for-plan-2-student-loans-2024-25
+
 thresholds <- data.frame(
   Country = c(
     "Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Czechia",
@@ -41,14 +51,14 @@ thresholds <- data.frame(
     "PT", "RO", "SK", "SI", "ES", "SE"
   ),
   lower = c(
-    27295, 27295, 10920, 16380, 21840, 16380, 32755, 21840, 27295,
-    27295, 27295, 21840, 16380, 21840, 16380, 16380, 27295, 21840,
-    27295, 16380, 21840, 10920, 16380, 21840, 21840, 27295
+    28470, 28470, 11390, 17085, 22780, 17085, 28470, 22780, 28470,
+    22780, 28470, 17085, 17085, 22780, 17085, 17085, 28470, 22780,
+    28470, 17085, 17085, 11390, 17085, 22780, 22780, 28470
   ),
   upper = c(
-    49130, 49130, 19655, 29480, 39305, 29480, 58960, 39305, 49130,
-    49130, 49130, 39305, 29480, 39305, 29480, 29480, 49130, 39305,
-    49130, 29480, 39305, 19655, 29480, 39305, 39305, 49130
+    51245, 51245, 20500, 30750, 41000, 30750, 51245, 41000, 51245,
+    41000, 51245, 30750, 30750, 41000, 30750, 30750, 51245, 41000,
+    51245, 30750, 30750, 20500, 30750, 41000, 41000, 51245
   )
 )
 ```
@@ -76,7 +86,11 @@ betas <- betas[, c(
 dat <- merge(thresholds, wages, by = "Country")
 dat <- merge(dat, betas, by = "Country")
 
-dat$wage_gbp <- dat$Wage_EURO * eur_gbp
+dat$wage_gbp_2024 <- dat$Wage_EURO * eur_gbp
+
+# Repayments begin in April 2025, one year after the observed wage reference.
+dat$wage_gbp <- dat$wage_gbp_2024 *
+  (1 + wage_growth)^years_to_first_repayment
 
 # Clear names for the three coefficient series.
 dat$beta_TWFE_no_controls <- as.numeric(dat$Estimate_TWFE)
@@ -91,7 +105,12 @@ dat[, c(
   "Country",
   "beta_TWFE_no_controls",
   "beta_TWFE_controls",
-  "beta_pooled"
+  "beta_pooled",
+  "Wage_EURO",
+  "wage_gbp_2024",
+  "wage_gbp",
+  "lower",
+  "upper"
 )]
 ```
 
@@ -270,7 +289,7 @@ for (j in seq_along(rho_grid)) {
 rho_insignificant <- rho_grid[which(income_p_value >= 0.05)[1]]
 rho_neutral <- rho_grid[which.min(abs(income_gradient))]
 
-cat("First insignificant income gradient ",
+cat("First grid rate with an insignificant income gradient ",
     round(100 * rho_insignificant, 1), "%\n", sep = "")
 cat("Income-neutral discount rate ",
     round(100 * rho_neutral, 1), "%\n", sep = "")
@@ -280,13 +299,37 @@ cat("Income-neutral discount rate ",
 
 ```{r}
 
-#Austria
-loan_pv(51907.76,27295, 49130, 0.03 )
+austria <- dat[dat$Country == "Austria", ]
+bulgaria <- dat[dat$Country == "Bulgaria", ]
 
-#Bulgaria
-loan_pv(13629.77, 10920, 19655, 0.03)
+austria_pv_3 <- loan_pv(
+  austria$wage_gbp,
+  austria$lower,
+  austria$upper,
+  0.03
+)
 
-(22200-loan_pv(13629.77, 10920, 19655, 0.03))/loan_pv(13629.77, 10920, 19655, 0.03)
+bulgaria_pv_3 <- loan_pv(
+  bulgaria$wage_gbp,
+  bulgaria$lower,
+  bulgaria$upper,
+  0.03
+)
+
+austria_log_price_change_3 <-
+  log(post_brexit_price) - log(austria_pv_3)
+
+bulgaria_log_price_change_3 <-
+  log(post_brexit_price) - log(bulgaria_pv_3)
+
+c(
+  austria_wage_gbp_2025 = austria$wage_gbp,
+  austria_pv_3 = austria_pv_3,
+  austria_log_price_change_3 = austria_log_price_change_3,
+  bulgaria_wage_gbp_2025 = bulgaria$wage_gbp,
+  bulgaria_pv_3 = bulgaria_pv_3,
+  bulgaria_log_price_change_3 = bulgaria_log_price_change_3
+)
 ```
 
 
@@ -816,4 +859,3 @@ mtext(
 
 par(mfrow = c(1, 1))
 ```
-

@@ -86,11 +86,12 @@ non_countries <- c(
 )
 
 data <- data %>%
-  filter(!Domicile_named_country %in% non_countries)
+  filter(!Domicile_named_country %in% non_countries) # Remove the non-countries
 
 # After removing the duplicated aggregate rows, the input must be a genuine
 # country-year panel. Summing below is then a defensive aggregation, not a way
 # to conceal duplicate records.
+
 stopifnot(!anyDuplicated(data[c("Domicile_named_country", "Year")]))
 
 # the 26 treated EU origin markets
@@ -121,10 +122,7 @@ data <- data %>%
 
 # Building the country-by-year trajectory matrix
 
-We collapse the data to one row per country and one column per year.
-Each cell is the total number of applicants for that country in that
-year. This wide matrix is the raw material for every distance and every
-fit that follows.
+We collapse the data to one row per country and one column per year. Each cell is the total number of applicants for that country in that year. This wide matrix is the raw material for every distance and every fit that follows.
 
 ```{r build-matrix}
 pre <- data %>%
@@ -174,6 +172,13 @@ logtraj <- logmat
 
 dim(logtraj)
 ```
+
+
+```{r}
+# For the descriptives
+psych::describe(data)
+```
+
 
 The resulting sample contains `r nrow(logmat)` countries observed over
 `r ncol(logmat)` pre-treatment years

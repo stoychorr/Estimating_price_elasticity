@@ -1,0 +1,819 @@
+---
+title: "Subjective-discount calculations"
+output: html_document
+---
+
+This file contains only the calculations needed for the subjective-discount
+exercise and the two figures used in the paper.
+
+The treated sample contains EU countries other than Ireland. The loan
+thresholds are the official 2021-22 Plan 2 overseas thresholds. Wages are
+converted from euros to pounds using the official rate of 0.885798.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readxl)
+library(lmtest)
+library(sandwich)
+
+loan_amount <- 9250
+post_brexit_price <- 22200
+repayment_rate <- 0.09
+wage_growth <- 0.02
+rpi <- 0.043
+interest_spread <- 0.03
+eur_gbp <- 0.885798
+```
+
+# Data
+
+```{r thresholds}
+thresholds <- data.frame(
+  Country = c(
+    "Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Czechia",
+    "Denmark", "Estonia", "Finland", "France", "Germany", "Greece",
+    "Hungary", "Italy", "Latvia", "Lithuania", "Luxembourg", "Malta",
+    "Netherlands", "Poland", "Portugal", "Romania", "Slovakia",
+    "Slovenia", "Spain", "Sweden"
+  ),
+  iso2c = c(
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+    "DE", "GR", "HU", "IT", "LV", "LT", "LU", "MT", "NL", "PL",
+    "PT", "RO", "SK", "SI", "ES", "SE"
+  ),
+  lower = c(
+    27295, 27295, 10920, 16380, 21840, 16380, 32755, 21840, 27295,
+    27295, 27295, 21840, 16380, 21840, 16380, 16380, 27295, 21840,
+    27295, 16380, 21840, 10920, 16380, 21840, 21840, 27295
+  ),
+  upper = c(
+    49130, 49130, 19655, 29480, 39305, 29480, 58960, 39305, 49130,
+    49130, 49130, 39305, 29480, 39305, 29480, 29480, 49130, 39305,
+    49130, 29480, 39305, 19655, 29480, 39305, 39305, 49130
+  )
+)
+```
+
+```{r inputs}
+wages <- read_excel("wages.xlsx", sheet = "main_df")
+betas <- read_excel("betas_saturated_model.xlsx", sheet = "main")
+
+# Remove additions such as "(European Union)" from country names.
+wages$Country <- trimws(sub("\\s*\\([^()]*\\)\\s*$", "", wages$Country))
+betas$Country <- trimws(sub("\\s*\\([^()]*\\)\\s*$", "", betas$Country))
+
+# Use one country name everywhere.
+wages$Country[wages$Country == "Czech Republic"] <- "Czechia"
+betas$Country[betas$Country == "Czech Republic"] <- "Czechia"
+
+wages <- wages[, c("Country", "Wage_EURO")]
+betas <- betas[, c(
+  "Country",
+  "Estimate_TWFE",
+  "Estimate_controls",
+  "Estimate_Pooled"
+)]
+
+dat <- merge(thresholds, wages, by = "Country")
+dat <- merge(dat, betas, by = "Country")
+
+dat$wage_gbp <- dat$Wage_EURO * eur_gbp
+
+# Clear names for the three coefficient series.
+dat$beta_TWFE_no_controls <- as.numeric(dat$Estimate_TWFE)
+dat$beta_TWFE_controls <- as.numeric(dat$Estimate_controls)
+dat$beta_pooled <- as.numeric(dat$Estimate_Pooled)
+
+dat <- dat[order(dat$iso2c), ]
+row.names(dat) <- NULL
+
+dat[, c(
+  "iso2c",
+  "Country",
+  "beta_TWFE_no_controls",
+  "beta_TWFE_controls",
+  "beta_pooled"
+)]
+```
+
+# GDP per capita <<<<
+
+Only the World Bank GDP-per-capita series is needed. If
+`wdi_snapshot.csv` already exists, the file is reused. Otherwise, the series is
+downloaded once and saved.
+
+```{r gdp}
+if (file.exists("wdi_snapshot.csv")) {
+  gdp <- read.csv("wdi_snapshot.csv")
+} else {
+  gdp <- WDI::WDI(
+    country = dat$iso2c,
+    indicator = c(GDP_PPP_pc = "NY.GDP.PCAP.PP.KD"), # check this if the same
+    start = 2018,
+    end = 2022,
+    extra = FALSE
+  )
+  write.csv(gdp, "wdi_snapshot.csv", row.names = FALSE)
+}
+
+gdp <- gdp[!is.na(gdp$GDP_PPP_pc), ]
+gdp <- gdp[order(gdp$iso2c, -gdp$year), ]
+gdp <- gdp[!duplicated(gdp$iso2c), c("iso2c", "GDP_PPP_pc")]
+
+dat <- merge(dat, gdp, by = "iso2c")
+dat$log_gdp <- log(dat$GDP_PPP_pc)
+dat <- dat[order(dat$iso2c), ]
+row.names(dat) <- NULL
+```
+
+# Which estimate is used
+
+Every subjective-discount elasticity below uses `beta_TWFE_controls`. This is
+the country-specific TWFE estimate from the specification with controls.
+
+`beta_TWFE_no_controls` is the country-specific TWFE estimate without
+controls. `beta_pooled` is the pooled estimate. These two series are shown only
+in the final raw-coefficient figure. They are not used to construct the main
+elasticities.
+
+```{r estimate-choice}
+beta_used_in_elasticities <- dat$beta_TWFE_controls
+```
+
+
+#intergeneartional wealth 
+
+```{r}
+library(haven)
+library(countrycode)
+
+gdim_file <- "gdim_income.dta"
+
+if (!file.exists(gdim_file)) {
+  download.file(
+    "https://datacatalogfiles.worldbank.org/ddh-published/0066878/DR0095414/IGE_Munoz_VanderWeide_June2025.dta",
+    gdim_file,
+    mode = "wb"
+  )
+}
+
+mobility <- read_dta(gdim_file)
+
+mobility$iso2c <- countrycode(
+  mobility$code,
+  origin = "iso3c",
+  destination = "iso2c"
+)
+
+mobility <- mobility[, c("iso2c", "IGE")]
+
+dat <- merge(
+  dat,
+  mobility,
+  by = "iso2c",
+  all.x = TRUE
+)
+
+dat <- dat[order(dat$iso2c), ]
+row.names(dat) <- NULL
+
+# Higher IGE means stronger income persistence and lower mobility
+dat[, c("iso2c", "Country", "IGE")]
+
+stopifnot(!any(is.na(dat$IGE)))
+```
+
+
+
+
+# Subjective value of the loan
+
+This is the only calculation function in the file. It simulates repayments for
+one country and returns their subjective present value.
+
+```{r loan-value}
+loan_pv <- function(wage, lower, upper, rho) {
+
+  balance <- loan_amount
+  pv <- 0
+
+  for (t in 1:30) {
+
+    earnings <- wage * (1 + wage_growth)^(t - 1)
+
+    if (earnings <= lower) loading <- 0
+    if (earnings > lower & earnings < upper) {
+      loading <- (earnings - lower) / (upper - lower)
+    }
+    if (earnings >= upper) loading <- 1
+
+    balance <- balance * (1 + rpi + interest_spread * loading)
+    payment <- min(repayment_rate * max(0, earnings - lower), balance)
+
+    pv <- pv + payment / (1 + rho)^t
+    balance <- balance - payment
+
+    if (balance <= 0) break
+  }
+
+  pv
+}
+```
+
+# Find the two discount-rate thresholds
+
+The search runs from 3% to 35%. At each rate, the code calculates the
+controlled-TWFE elasticities, regresses them on log GDP per capita, and stores
+the income-gradient coefficient and its HC1 p-value.
+
+```{r thresholds-search}
+rho_grid <- seq(0.03, 0.35, by = 0.001)
+
+elasticity_grid <- matrix(
+  NA_real_,
+  nrow = nrow(dat),
+  ncol = length(rho_grid)
+)
+
+income_gradient <- numeric(length(rho_grid))
+income_p_value <- numeric(length(rho_grid))
+
+for (j in seq_along(rho_grid)) {
+
+  pv <- mapply(
+    
+    loan_pv,
+    
+    dat$wage_gbp,
+    
+    dat$lower,
+    
+    dat$upper,
+    
+    MoreArgs = list(rho = rho_grid[j])
+    
+  )
+
+  experienced_price_change <- log(post_brexit_price) - log(pv)
+
+  elasticity_grid[, j] <- beta_used_in_elasticities / experienced_price_change
+
+  model <- lm(elasticity_grid[, j] ~ dat$log_gdp)
+
+  income_gradient[j] <- coef(model)[2]
+  
+  income_p_value[j] <- coeftest(
+    model,
+    vcov. = vcovHC(model, type = "HC1")
+  )[2, 4]
+}
+
+rho_insignificant <- rho_grid[which(income_p_value >= 0.05)[1]]
+rho_neutral <- rho_grid[which.min(abs(income_gradient))]
+
+cat("First insignificant income gradient ",
+    round(100 * rho_insignificant, 1), "%\n", sep = "")
+cat("Income-neutral discount rate ",
+    round(100 * rho_neutral, 1), "%\n", sep = "")
+```
+
+# EXAMPLE IN TEXT
+
+```{r}
+
+#Austria
+loan_pv(51907.76,27295, 49130, 0.03 )
+
+#Bulgaria
+loan_pv(13629.77, 10920, 19655, 0.03)
+
+(22200-loan_pv(13629.77, 10920, 19655, 0.03))/loan_pv(13629.77, 10920, 19655, 0.03)
+```
+
+
+
+# Figure 5 Panel C
+
+The orange point uses the controlled-TWFE elasticity when the income gradient
+first becomes insignificant. The blue point uses the controlled-TWFE
+elasticity at income neutrality. The green point uses the same controlled-TWFE
+coefficient at a 35% subjective discount rate. The shaded interval shows the
+literature range from -0.80 to -0.10.
+
+```{r country-elasticities, fig.width=8, fig.height=8.5}
+eta_insignificant <- elasticity_grid[
+  , which.min(abs(rho_grid - rho_insignificant))
+]
+
+eta_neutral <- elasticity_grid[
+  , which.min(abs(rho_grid - rho_neutral))
+]
+
+eta_35 <- elasticity_grid[, ncol(elasticity_grid)]
+
+elasticities <- cbind(
+  eta_insignificant,
+  eta_neutral,
+  eta_35
+)
+
+literature_bounds <- c(-0.80, -0.10)
+country_order <- order(rowMeans(elasticities))
+y <- seq_len(nrow(dat))
+
+par(mar = c(8, 4, 5, 2))
+
+plot(
+  range(c(elasticities, literature_bounds)),
+  range(y),
+  type = "n",
+  yaxt = "n",
+  xlab = "Estimated price elasticity",
+  ylab = ""
+)
+
+axis(
+  2,
+  at = y,
+  labels = dat$iso2c[country_order],
+  las = 1,
+  tick = FALSE
+)
+
+rect(
+  literature_bounds[1],
+  par("usr")[3],
+  literature_bounds[2],
+  par("usr")[4],
+  col = adjustcolor("grey70", alpha.f = 0.3),
+  border = NA
+)
+
+abline(v = 0, col = "grey60")
+
+segments(
+  apply(elasticities[country_order, ], 1, min),
+  y,
+  apply(elasticities[country_order, ], 1, max),
+  y,
+  col = "#9FB4C7",
+  lwd = 4
+)
+
+points(
+  eta_insignificant[country_order], y,
+  pch = 16, col = "#D55E00"
+)
+
+points(
+  eta_neutral[country_order], y,
+  pch = 16, col = "#1F4E79"
+)
+
+points(
+  eta_35[country_order], y,
+  pch = 16, col = "#009E73"
+)
+
+title(
+  "Country elasticities under alternative discount rates",
+  line = 2
+)
+
+mtext(
+  paste0(
+    "Insignificance at ", round(100 * rho_insignificant, 1),
+    "%, income neutrality at ", round(100 * rho_neutral, 1),
+    "%, and upper benchmark at 35%"
+  ),
+  side = 3,
+  line = 0.5
+)
+
+legend(
+  "bottom",
+  inset = c(0, -0.32),
+  xpd = NA,
+  ncol = 2,
+  legend = c(
+    "Insignificance threshold",
+    "Income neutrality",
+    "35% discount rate",
+    "Literature bounds"
+  ),
+  col = c(
+    "#D55E00",
+    "#1F4E79",
+    "#009E73",
+    adjustcolor("grey70", alpha.f = 0.6)
+  ),
+  pch = c(16, 16, 16, 15),
+  pt.cex = c(1, 1, 1, 2),
+  cex = 0.8,
+  bty = "n"
+)
+```
+
+# Figure 5 Panel B
+
+This figure uses the raw country coefficients from the beta workbook. No
+subjective present-value correction is applied. GDP per capita is also shown in
+levels instead of logs. The three panels therefore display the baseline
+country correlations before the elasticity calibration.
+
+```{r raw-correlations, fig.width=9, fig.height=4.5}
+raw_estimates <- cbind(
+  dat$beta_TWFE_controls,
+  dat$beta_TWFE_no_controls,
+  dat$beta_pooled
+)
+
+panel_names <- c(
+  "TWFE with controls",
+  "TWFE without controls",
+  "Pooled"
+)
+
+panel_colours <- c("#1F4E79", "#D55E00", "#009E73")
+log_gdp <- dat$log_gdp
+
+par(
+  mfrow = c(1, 3),
+  oma = c(4, 4, 3, 1),
+  mar = c(2, 2, 3, 1)
+)
+
+for (j in 1:3) {
+
+  plot(
+    log_gdp,
+    raw_estimates[, j],
+    pch = 16,
+    col = panel_colours[j],
+    xlab = "",
+    ylab = "",
+    main = panel_names[j]
+  )
+
+  text(
+    log_gdp,
+    raw_estimates[, j],
+    labels = dat$iso2c,
+    pos = 3,
+    cex = 0.65,
+    col = panel_colours[j]
+  )
+
+  abline(
+    lm(raw_estimates[, j] ~ log_gdp),
+    col = "red",
+    lwd = 2
+  )
+
+  mtext(
+    paste0("Correlation = ",
+           round(cor(log_gdp, raw_estimates[, j]), 2)),
+    side = 3,
+    line = 0.2,
+    cex = 0.75
+  )
+}
+
+mtext(
+  "GDP per capita, PPP, constant, thousands",
+  side = 1,
+  outer = TRUE,
+  line = 2.2
+)
+
+mtext(
+  "Raw country coefficient",
+  side = 2,
+  outer = TRUE,
+  line = 2.2
+)
+
+mtext(
+  "Raw treatment coefficients and log of GDP per capita",
+  side = 3,
+  outer = TRUE,
+  line = 1.3,
+  cex = 1.1
+)
+
+par(mfrow = c(1, 1))
+```
+
+# Figure 5 Panel A
+
+```{r}
+three_elasticities <- cbind(
+  elasticity_grid[, 1],
+  eta_neutral,
+  eta_35
+)
+
+three_titles <- c(
+  "rho = 3.0%",
+  paste0("gamma = 0\nrho = ", round(100 * rho_neutral, 1), "%"),
+  "rho = 35.0%"
+)
+
+par(
+  mfrow = c(1, 3),
+  oma = c(4, 4, 4, 1),
+  mar = c(2, 2, 3, 1)
+)
+
+for (j in 1:3) {
+
+  plot(
+    dat$log_gdp,
+    three_elasticities[, j],
+    pch = 16,
+    col = "#1F4E79",
+    xlab = "",
+    ylab = "",
+    main = three_titles[j]
+  )
+
+  text(
+    dat$log_gdp,
+    three_elasticities[, j],
+    labels = dat$iso2c,
+    pos = 3,
+    cex = 0.65,
+    col = "#1F4E79"
+  )
+
+  abline(
+    lm(three_elasticities[, j] ~ dat$log_gdp),
+    col = "red",
+    lwd = 2
+  )
+}
+
+mtext(
+  "log GDP per capita, PPP, constant",
+  side = 1,
+  outer = TRUE,
+  line = 2.2
+)
+
+mtext(
+  expression(eta[j]),
+  side = 2,
+  outer = TRUE,
+  line = 2.2
+)
+
+mtext(
+  "Country elasticities at 3%, income neutrality, and 35%",
+  side = 3,
+  outer = TRUE,
+  line = 1.5,
+  cex = 1.15
+)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+# All elasticities use the controlled-TWFE coefficients
+
+rho_alt <- seq(0.03, 0.40, by = 0.005)
+
+eta_alt <- matrix(
+  NA_real_,
+  nrow = nrow(dat),
+  ncol = length(rho_alt)
+)
+
+for (j in seq_along(rho_alt)) {
+
+  pv <- mapply(
+    loan_pv,
+    dat$wage_gbp,
+    dat$lower,
+    dat$upper,
+    MoreArgs = list(rho = rho_alt[j])
+  )
+
+  eta_alt[, j] <- beta_used_in_elasticities /
+    (log(post_brexit_price) - log(pv))
+}
+
+wdi <- read.csv("wdi_snapshot.csv")
+
+wdi$log_cons <- log(wdi$HH_cons_pc)
+wdi$log_gdp <- log(wdi$GDP_PPP_pc)
+wdi$log_gni <- log(wdi$GNI_PPP_pc)
+wdi$log_pop <- log(wdi$Population)
+
+covariate_names <- c(
+  "Educ_spend_gdp",
+  "GDP_growth",
+  "Gini",
+  "Inflation",
+  "log_cons",
+  "log_gdp",
+  "log_gni",
+  "log_pop",
+  "Tertiary_attain",
+  "Tertiary_enrol",
+  "Unemp",
+  "Youth_unemp"
+)
+
+panel_names <- c(
+  "Education spending",
+  "GDP growth",
+  "Gini",
+  "Inflation",
+  "Consumption per capita",
+  "GDP per capita",
+  "GNI per capita",
+  "Population",
+  "Tertiary attainment",
+  "Tertiary enrolment",
+  "Unemployment",
+  "Youth unemployment"
+)
+
+covariates <- matrix(
+  NA_real_,
+  nrow = nrow(dat),
+  ncol = length(covariate_names)
+)
+
+for (v in seq_along(covariate_names)) {
+
+  for (i in seq_len(nrow(dat))) {
+
+    country_data <- wdi[
+      wdi$iso2c == dat$iso2c[i] &
+        !is.na(wdi[[covariate_names[v]]]),
+    ]
+
+    if (nrow(country_data) > 0) {
+
+      latest <- which.max(country_data$year)
+
+      covariates[i, v] <-
+        country_data[[covariate_names[v]]][latest]
+    }
+  }
+}
+
+# Add intergenerational income persistence
+# Higher IGE means lower intergenerational mobility
+
+covariates <- cbind(
+  covariates,
+  IGE = as.numeric(dat$IGE)
+)
+
+covariate_names <- c(
+  covariate_names,
+  "IGE"
+)
+
+panel_names <- c(
+  panel_names,
+  "Intergenerational\nincome persistence"
+)
+
+# Correlations and HC1 confidence intervals
+
+correlations <- matrix(
+  NA_real_,
+  nrow = length(rho_alt),
+  ncol = length(covariate_names)
+)
+
+ci_lower <- correlations
+ci_upper <- correlations
+
+for (v in seq_along(covariate_names)) {
+
+  for (j in seq_along(rho_alt)) {
+
+    ok <- is.finite(covariates[, v]) &
+      is.finite(eta_alt[, j])
+
+    x <- covariates[ok, v]
+    y <- eta_alt[ok, j]
+
+    model <- lm(scale(y) ~ scale(x))
+
+    robust_result <- coeftest(
+      model,
+      vcov. = vcovHC(model, type = "HC1")
+    )
+
+    correlations[j, v] <- robust_result[2, 1]
+
+    ci_lower[j, v] <- robust_result[2, 1] -
+      1.96 * robust_result[2, 2]
+
+    ci_upper[j, v] <- robust_result[2, 1] +
+      1.96 * robust_result[2, 2]
+  }
+}
+
+# Plot
+
+par(
+  mfrow = c(4, 4),
+  oma = c(4, 4, 5, 1),
+  mar = c(2, 2.5, 2.5, 1)
+)
+
+for (v in seq_along(covariate_names)) {
+
+  plot(
+    100 * rho_alt,
+    correlations[, v],
+    type = "n",
+    xaxt = "n",
+    xlab = "",
+    ylab = "",
+    ylim = range(
+      ci_lower[, v],
+      ci_upper[, v],
+      na.rm = TRUE
+    ),
+    main = panel_names[v]
+  )
+
+  polygon(
+    c(100 * rho_alt, rev(100 * rho_alt)),
+    c(ci_lower[, v], rev(ci_upper[, v])),
+    col = adjustcolor("#1F4E79", alpha.f = 0.15),
+    border = NA
+  )
+
+  grid(col = "grey90")
+  abline(h = 0, col = "grey60")
+
+  lines(
+    100 * rho_alt,
+    correlations[, v],
+    col = "#1F4E79",
+    lwd = 2
+  )
+
+  axis(
+    1,
+    at = c(3, 10, 20, 30, 40),
+    labels = paste0(c(3, 10, 20, 30, 40), "%")
+  )
+
+  sign_change <- which(
+    correlations[-nrow(correlations), v] *
+      correlations[-1, v] < 0
+  )[1]
+
+  if (!is.na(sign_change)) {
+
+    abline(
+      v = 100 * rho_alt[sign_change],
+      col = "red",
+      lwd = 2
+    )
+  }
+}
+
+mtext(
+  "Subjective discount rate",
+  side = 1,
+  outer = TRUE,
+  line = 2.2
+)
+
+mtext(
+  expression("Correlation with " * eta[j]),
+  side = 2,
+  outer = TRUE,
+  line = 2.2
+)
+
+mtext(
+  "Which correlations survive the discounting assumption",
+  side = 3,
+  outer = TRUE,
+  line = 2.5,
+  cex = 1.2
+)
+
+mtext(
+  "Shaded bands show 95% HC1 confidence intervals; red line marks a sign change",
+  side = 3,
+  outer = TRUE,
+  line = 1.2,
+  cex = 0.85
+)
+
+par(mfrow = c(1, 1))
+```
+

@@ -75,7 +75,7 @@ non_countries <- c(
 
 ```{r}
 # Path to the control-group construction output. Defined once here so it is not
-# repeated. Make this relative if you move the bundle to another machine.
+# repeated. 
 control_group_file <- "control_group_output.xlsx"
 
 # Read the donor/weights sheet ONCE.
@@ -97,6 +97,8 @@ regression_weights <- donor_raw %>%
 # c("Australia", "Saudi Arabia", "Russian Federation", "Peru", "Kuwait", "Bahrain","Singapore","Switzerland", "Hong Kong", "United States of America",  "Thailand", "Canada", "Mauritius", "Qatar", "Norway", "Israel", "Malaysia", "Jordan", "Albania", "Serbia", "Ireland", "Jersey", "Macao","United Arab Emirates", "Vietnam [Viet Nam]", "Turkey")
 ```
 
+### For the robustness section only
+
 ```{r}
 # Full cleaned panel (all countries present in the file, post-2015).
 # Used by the donor-pool robustness section.
@@ -115,6 +117,9 @@ stopifnot(
   all(is.finite(apps_clean$log_app))
 )
 ```
+
+
+### For the main analysis
 
 ```{r}
 # panel_main: the baseline treated + synthetic analysis frame, built ONCE.
@@ -244,8 +249,13 @@ m_sat_DK3 <- feols(
 summary(m_sat_DK)
 summary(m_sat_DK1)
 summary(m_sat_DK2)
-summary(m_sat_DK3)
+summary(m_sat_DK3) #unweighted
 ```
+
+```{r}
+psych::describe(panel_main)
+```
+
 
 ```{r eval=FALSE, include=FALSE}
 # summary(panel_main[, c(1,2,3,10,11,12)] %>% filter(Treated == 1))
@@ -1240,6 +1250,7 @@ s3 <- feols(
 
 # S4: add GDP + working-age population + youth unemployment
 # (weighted, like S1-S3, so the table is a like-for-like comparison)
+
 s4 <- feols(
   log_app ~ i(treated_factor, Post, ref = "CONTROL") + c_log_GDPpc + c_log_Pop15_64 + c_YouthUnempl | Domicile_named_country + Year,
   data = panel_wb_sat, panel.id = ~ Domicile_named_country + Year,
@@ -1328,14 +1339,18 @@ ggplot(elas_plot, aes(x = elasticity, y = country, color = model, group = countr
   theme_classic(base_size = 13) +
   theme(
     plot.title = element_text(face = "bold", size = 15),
+    
     plot.subtitle = element_text(size = 11),
+    
     axis.text.y = element_text(size = 10),
+    
     legend.position = "top",
+    
     legend.text = element_text(size = 10)
   )
 ```
 
-#Models for step 3
+# Models for step 3
 
 ```{r}
 library(broom)
@@ -1395,198 +1410,85 @@ write.xlsx(
 )
 ```
 
-# Descriptives
+# Synthetic difference-in-differences data prep 
 
-```{r}
-library(psych)
-library(openxlsx)
+This section stands apart from the rest of the manuscript.  It asks what a single synthetic difference-in-differences estimate looks like when every non-EU country in the cleaned file is thrown into the donor pool at once, with no hand-picked controls and no regression weighting. The estimator follows Arkhangelsky et al. (2021) and runs through the synthdid package, which blends synthetic control unit weights with difference-in-differences time weights in one step.
 
-main_vars <- c(
-  "Applicants",
-  "log_app",
-  "EU",
-  "Post",
-  "event_time",
-  "regression_weight"
-)
-
-wb_vars <- c(
-  "Applicants",
-  "log_app",
-  "EU",
-  "Post",
-  "did",
-  "event_time",
-  "regression_weight",
-  "GDPpc",
-  "Pop15_64",
-  "YouthUnempl",
-  "EduSpendGDP",
-  "c_log_GDPpc",
-  "c_log_Pop15_64",
-  "c_YouthUnempl"
-)
-
-desc_main <- psych::describe(
-  panel_main[, intersect(main_vars, names(panel_main))],
-  fast = FALSE
-)
-
-desc_wb <- psych::describe(
-  panel_wb[, intersect(wb_vars, names(panel_wb))],
-  fast = FALSE
-)
-
-desc_main <- data.frame(
-  Variable = rownames(desc_main),
-  desc_main,
-  row.names = NULL
-)
-
-desc_wb <- data.frame(
-  Variable = rownames(desc_wb),
-  desc_wb,
-  row.names = NULL
-)
-
-openxlsx::write.xlsx(
-  list(
-    panel_main = desc_main,
-    panel_wb = desc_wb
-  ),
-  "compact_descriptives.xlsx",
-  overwrite = TRUE
-)
-```
-
-
-# Standalone synthetic difference-in-differences on the full donor pool
-
-This section stands apart from the rest of the manuscript. It does not feed any headline number and it ignores the curated synthetic control weights used earlier. The point is narrow. It asks what a single synthetic difference-in-differences estimate looks like when every non-EU country in the cleaned file is thrown into the donor pool at once, with no hand-picked controls and no regression weighting. The estimator follows Arkhangelsky et al. (2021) and runs through the synthdid package, which blends synthetic control unit weights with difference-in-differences time weights in one step.
-
-Use synthdid version 0.0.9, the version audited for this file, or record and review any later version before updating the results.
-
-
-The estimator needs three things. A balanced panel where every unit appears in every year, one common adoption date shared by all treated units, and a clean 0/1 treatment indicator that switches on for treated units in treated years. The EU block all move together in 2021, so the block design holds. We start from apps_clean, drop any country whose applicant count hits zero in some year (its log outcome is not finite), then keep only countries observed in every year so the panel is balanced.
+Use synthdid version 0.0.9, the version audited for this file, or record and review any later version before updating the results. The estimator needs three things. A balanced panel where every unit appears in every year, one common adoption date shared by all treated units, and a clean 0/1 treatment indicator that switches on for treated units in treated years. 
 
 ```{r}
 library(synthdid)
 library(dplyr)
 
-# Years included in the analysis
-all_years <- sort(unique(apps_clean$Year))
-n_years <- length(all_years)
-stopifnot(identical(all_years, 2016:2025))
-stopifnot(!any(apps_clean$Domicile_named_country %in% non_countries))
+analysis_years <- seq(2016, 2025)
 
-# Construct one observation per country and year
 sdid_long <- apps_clean %>%
+  filter(
+    Year %in% analysis_years,
+    !Domicile_named_country %in% non_countries,
+    !is.na(Domicile_named_country),
+    !is.na(EU),
+    !is.na(Applicants),
+    is.finite(log_app)
+  ) %>%
   select(
     Domicile_named_country,
     Year,
+    Applicants,
     log_app,
     EU
   ) %>%
-  filter(
-    !is.na(Domicile_named_country),
-    !is.na(Year),
-    !is.na(EU)
-  ) %>%
-  group_by(Domicile_named_country, Year) %>%
-  summarise(
-    log_app = mean(log_app),
-    EU = first(EU),
-    n_EU_values = n_distinct(EU),
-    .groups = "drop"
-  )
-
-# Stop if the same country has conflicting EU classifications
-stopifnot(all(sdid_long$n_EU_values == 1))
-
-sdid_long <- sdid_long %>%
-  select(-n_EU_values)
-
-# Remove any country with a non-finite outcome in at least one year
-bad_countries <- sdid_long %>%
-  group_by(Domicile_named_country) %>%
-  summarise(
-    bad_outcome = any(!is.finite(log_app)),
-    .groups = "drop"
-  ) %>%
-  filter(bad_outcome) %>%
-  pull(Domicile_named_country)
-
-sdid_long <- sdid_long %>%
-  filter(!Domicile_named_country %in% bad_countries)
-
-# Keep only countries observed exactly once in every analysis year
-sdid_long <- sdid_long %>%
   group_by(Domicile_named_country) %>%
   filter(
-    n() == n_years,
-    n_distinct(Year) == n_years,
-    all(all_years %in% Year)
+    n() == length(analysis_years),
+    n_distinct(Year) == length(analysis_years),
+    n_distinct(EU) == 1,
+    all(Applicants >= 25)
   ) %>%
-  ungroup()
-
-# Treatment starts for EU countries in 2021
-sdid_long <- sdid_long %>%
+  ungroup() %>%
   mutate(
     treated = as.integer(EU == 1 & Year >= 2021)
   ) %>%
   arrange(Domicile_named_country, Year)
 
-# Strict balance checks
 stopifnot(
   !anyDuplicated(
     sdid_long[c("Domicile_named_country", "Year")]
-  )
-)
-
-stopifnot(
+  ),
+  all(sdid_long$Applicants >= 25),
+  all(is.finite(sdid_long$log_app)),
   nrow(sdid_long) ==
     n_distinct(sdid_long$Domicile_named_country) *
-    n_distinct(sdid_long$Year)
+    length(analysis_years)
 )
-
-stopifnot(
-  all(is.finite(sdid_long$log_app))
-)
-
-# Sanity checks
-n_distinct(
-  sdid_long$Domicile_named_country[sdid_long$EU == 0]
-)
-
-n_distinct(
-  sdid_long$Domicile_named_country[sdid_long$EU == 1]
-)
-
-range(sdid_long$Year)
 
 sdid_long %>%
-  count(Domicile_named_country) %>%
   summarise(
-    minimum_years = min(n),
-    maximum_years = max(n)
+    countries = n_distinct(Domicile_named_country),
+    controls = n_distinct(Domicile_named_country[EU == 0]),
+    treated_countries = n_distinct(Domicile_named_country[EU == 1]),
+    minimum_applicants = min(Applicants)
   )
 
-# Hand the long panel to panel.matrices, which reshapes it into the wide
-# outcome matrix and reports the number of controls and pre-periods.
 setup <- panel.matrices(
   as.data.frame(sdid_long),
-  unit      = "Domicile_named_country",
-  time      = "Year",
-  outcome   = "log_app",
+  unit = "Domicile_named_country",
+  time = "Year",
+  outcome = "log_app",
   treatment = "treated"
 )
 
-# how many donors and how many pre-periods the estimator is working with
 setup$N0
 setup$T0
 ```
 
-The estimate is one line. Standard errors come from the jackknife, which is the right choice here because the treated group holds many units. The placebo variant shown in the package documentation is meant for the single treated unit case and does not apply.
+
+```{r}
+psych::describe(sdid_long)
+```
+
+
+The estimate is one line. Standard errors come from the jackknife. The placebo variant shown in the package documentation is meant for the single treated unit case and does not apply.
 
 ```{r}
 tau_hat <- synthdid_estimate(setup$Y, setup$N0, setup$T0)
@@ -1616,69 +1518,92 @@ The pooled run above treats the whole EU block as one unit. The saturated design
 We reuse `sdid_long`, which is already balanced and cleaned. For each treated country we keep that country plus every non-EU donor, flip the treatment on for that country from 2021, and read off the point estimate. We collect point estimates only. Per-country standard errors would need the placebo or bootstrap variance rather than the jackknife, since the jackknife needs at least two treated units.
 
 ```{r}
-# EU countries that survived the balance filter
-eu_countries <- sort(unique(sdid_long$Domicile_named_country[sdid_long$EU == 1]))
+eu_countries <- sort(unique(
+  sdid_long$Domicile_named_country[sdid_long$EU == 1]
+))
 
-# one synthdid run per treated country against the shared non-EU donor pool
-sdid_by_country <- sapply(eu_countries, function(j) {
+sdid_country_results <- bind_rows(lapply(eu_countries, function(j) {
+
   panel_j <- sdid_long %>%
     filter(Domicile_named_country == j | EU == 0) %>%
-    mutate(treated_j = as.integer(Domicile_named_country == j & Year >= 2021))
+    mutate(
+      treated_j = as.integer(
+        Domicile_named_country == j & Year >= 2021
+      )
+    )
 
   setup_j <- panel.matrices(
     as.data.frame(panel_j),
-    unit      = "Domicile_named_country",
-    time      = "Year",
-    outcome   = "log_app",
+    unit = "Domicile_named_country",
+    time = "Year",
+    outcome = "log_app",
     treatment = "treated_j"
   )
 
-  as.numeric(synthdid_estimate(setup_j$Y, setup_j$N0, setup_j$T0))
-})
+  tau_j <- synthdid_estimate(
+    setup_j$Y,
+    setup_j$N0,
+    setup_j$T0
+  )
 
-sdid_by_country
+  se_j <- as.numeric(sqrt(
+    vcov(tau_j, method = "placebo")
+  ))
+
+  tibble(
+    country = j,
+    estimate = as.numeric(tau_j),
+    standard_error = se_j,
+    panel_units = nrow(setup_j$Y),
+    panel_periods = ncol(setup_j$Y),
+    control_units = setup_j$N0,
+    treated_units = nrow(setup_j$Y) - setup_j$N0,
+    pre_periods = setup_j$T0,
+    post_periods = ncol(setup_j$Y) - setup_j$T0
+  )
+}))
+
+print(
+  sdid_country_results,
+  n = Inf,
+  width = Inf
+)
 ```
 
-## Saturated TWFE versus synthetic difference-in-differences
-
-Now line the two sets of country coefficients up in one table. The saturated two-way fixed-effects effects come from `m_sat_DK`, and the synthetic difference-in-differences effects come from the per-country loop above. Both sit on the log applicant scale, so the columns are directly comparable, and the difference column flags any country where the mechanically chosen synthetic control disagrees with the pooled year fixed effect.
-
 ```{r}
-library(broom)
-library(knitr)
-
-# saturated TWFE coefficients, one per treated country
-sat_twfe <- tidy(m_sat_DK) %>%
-  filter(grepl("^treated_factor::", term)) %>%
-  transmute(
-    country = gsub(":Post$", "", gsub("^treated_factor::", "", term)),
-    beta_saturated_twfe = estimate
+sdid_country_results <- sdid_country_results %>%
+  rename(
+    placebo_standard_error = standard_error
+  ) %>%
+  mutate(
+    z_value = estimate / placebo_standard_error,
+    p_value = 2 * pnorm(-abs(z_value)),
+    stars = case_when(
+      p_value < 0.01 ~ "***",
+      p_value < 0.05 ~ "**",
+      p_value < 0.10 ~ "*",
+      TRUE ~ ""
+    ),
+    estimate_with_stars = sprintf("%.3f%s", estimate, stars),
+    percentage_change = 100 * (exp(estimate) - 1),
+    conf_low = estimate - 1.96 * placebo_standard_error,
+    conf_high = estimate + 1.96 * placebo_standard_error
   )
 
-# per-country synthetic difference-in-differences estimates
-sdid_tab <- tibble(
-  country = names(sdid_by_country),
-  beta_synthetic_did = as.numeric(sdid_by_country)
-)
-
-# compare
-comparison <- sat_twfe %>%
-  left_join(sdid_tab, by = "country") %>%
-  mutate(difference = beta_saturated_twfe - beta_synthetic_did) %>%
-  arrange(beta_saturated_twfe)
-
-kable(comparison, digits = 3,
-      col.names = c("Country", "Saturated TWFE", "Synthetic DiD", "Difference"))
-
-comparison_summary <- comparison %>%
-  summarise(
-    correlation = cor(beta_saturated_twfe, beta_synthetic_did),
-    mean_absolute_difference = mean(abs(difference)),
-    largest_absolute_difference = max(abs(difference))
-  )
-
-comparison_summary
-write.csv(comparison, "table5_synthetic_did_comparison.csv", row.names = FALSE)
+sdid_country_results %>%
+  select(
+    country,
+    estimate_with_stars,
+    placebo_standard_error,
+    p_value,
+    percentage_change,
+    panel_units,
+    control_units,
+    treated_units,
+    pre_periods,
+    post_periods
+  ) %>%
+  print(n = Inf, width = Inf)
 ```
 
 The corrected donor pool yields a correlation of about 0.978 and a mean absolute difference of about 0.163 log points. Portugal has the largest absolute discrepancy at about 0.418 log points. The designs agree closely on the ranking, although their level differences remain economically relevant for several countries.
@@ -1690,9 +1615,8 @@ Arkhangelsky, D., Athey, S., Hirshberg, D. A., Imbens, G. W., & Wager, S. (2021)
 
 
 
-# Bonus. Rambachan-Roth parallel-trends sensitivity
+# Rambachan-Roth parallel-trends sensitivity
 
-This standalone section checks how robust the event study is to violations of parallel trends using Rambachan and Roth (2023). A passed pre-trend Wald test does not by itself settle that concern (Roth, 2022). The code reuses the country-clustered event-study model estimated above.
 
 ## Rambachan-Roth sensitivity with HonestDiD
 

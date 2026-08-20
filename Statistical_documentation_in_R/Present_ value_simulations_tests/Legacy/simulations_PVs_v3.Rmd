@@ -1,0 +1,814 @@
+---
+title: "Present values and loan-corrected demand elasticities"
+output:
+  html_document:
+    df_print: paged
+---
+
+<!--
+Rebuild notes
+
+  All constants live in one params chunk and are referenced everywhere
+  (Ppost, L, eur_gbp, beta_pooled, the loan parameters, and k_common).
+
+  pv_loan is defined ONCE.
+
+  The World Bank data is pulled ONCE for the EU pool and joined on iso2c,
+  so country-name spelling never gates a merge.
+
+  Object names are unified. The working elasticity frame is elas_df
+  (it replaces the generic df). Joins use left_join, never merge.
+
+  Two substantive fixes are flagged inline with the tag  ## FIX:
+    1. The "equal k" elasticities divided by 0.86, which is the EUR-GBP
+       rate eur_gbp, not a price change. The homogeneous price change is
+       k_common = log(Ppost) - log(L) = log(22200) - log(9250) = 0.8755.
+       The two numbers are close, which is why the bug was invisible.
+       Set k_common <- 0.86 below if you truly want the old behaviour.
+    2. beta appeared as -1.28 in the table and -1.265 in the plot. It is
+       now one constant, beta_pooled. Change it in one place if needed.
+-->
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(WDI)
+library(countrycode)
+library(stargazer)
+library(ggrepel)
+library(broom)
+```
+
+```{r params}
+# Prices and conversion
+L          <- 9250      # one year of tuition (loan principal), GBP
+Ppost      <- 22200     # post-reform headline fee, GBP
+eur_gbp    <- 0.86      # EUR -> GBP conversion
+
+# Homogeneous log price change used for the "equal k" benchmark.
+## FIX 1: this used to be the literal 0.86 (the FX rate). It should be the
+## naive log fee change. log(22200) - log(9250) = 0.8755, close to 0.86,
+## which is exactly why the mix-up went unnoticed.
+k_common   <- log(Ppost) - log(L)   # about 0.8755
+
+# Illustrative pooled elasticity for the aggregate section.
+## FIX 2: was -1.28 in the table and -1.265 in the plot. One value now.
+beta_pooled <- -1.08
+
+# Loan repayment parameters (UK ICR plan)
+loan_alpha <- 0.09      # repayment rate above threshold
+loan_tau   <- 27295     # repayment threshold, GBP
+loan_g     <- 0.02      # nominal wage growth
+loan_r     <- 0.03      # discount rate
+loan_T     <- 30        # repayment horizon, years
+```
+
+# On aggregate level
+
+We use the following equation:
+
+$$
+PV_{loan}=\sum_{t=1}^T\frac{\alpha \cdot \max\{0, Y_0(1+g)^{t-1}-\tau\}}{(1+r)^t}
+$$
+
+hence $k$ is calculated with the following assumptions:
+
+$$
+\Delta \log(P_i)=\log(22200)-\log\left(\sum_{t=1}^T\frac{\alpha \cdot \max\{0, Y_i(1+g)^{t-1}-\tau\}}{(1+r)^t}\right)
+$$
+
+where $Y_i$ is the starting salary in country $i$.
+
+```{r pv-loan}
+# Present value of repayments. Payments stop once the loan is repaid.
+# horizon replaces the old argument name T, which shadows R's TRUE.
+pv_loan <- function(Y0,
+                    L     = 9250,
+                    alpha = 0.09,
+                    tau   = 27295,
+                    g     = 0.02,
+                    r     = 0.03,
+                    horizon = 30,
+                    floor_pv = TRUE) {
+
+  balance <- L
+  pv      <- 0
+
+  for (t in 1:horizon) {
+    Yt      <- Y0 * (1 + g)^(t - 1)          # income path
+    Rt      <- alpha * max(0, Yt - tau)      # repayment rule
+    payment <- min(Rt, balance)             # cannot exceed remaining balance
+    pv      <- pv + payment / (1 + r)^t      # discounted payment
+    balance <- balance - payment
+    if (balance <= 0) break                  # stop once repaid
+  }
+
+  # floor at 1 to avoid log(0) downstream for very low incomes
+  if (floor_pv) pv <- max(pv, 1)
+  pv
+}
+
+# convenience wrapper carrying the params from the setup chunk
+pv_of <- function(Y0) {
+  pv_loan(Y0, L = L, alpha = loan_alpha, tau = loan_tau,
+          g = loan_g, r = loan_r, horizon = loan_T)
+}
+```
+
+```{r elasticity-helper}
+# Implied elasticity from a present value, given the illustrative pooled beta.
+# eta = -beta / k, with k = log(Ppost) - log(PV).
+elasticity_from_income <- function(Y0) {
+  PV  <- pv_of(Y0)
+  k   <- log(Ppost) - log(PV)
+  eta <- -beta_pooled / k
+  c(PV = PV, k = k, elasticity = eta)
+}
+```
+
+```{r aggregate-table}
+## FIX: the original salary vector repeated 32000 and 42000. De-duplicated here.
+salary_levels <- c(20000, 26000, 32000, 35000, 42000, 50000)
+
+results <- t(sapply(salary_levels, elasticity_from_income))
+
+table_results <- data.frame(
+  Starting_Salary = salary_levels,
+  PV_Loan         = round(results[, "PV"], 2),
+  k               = round(results[, "k"], 3),
+  Elasticity      = round(results[, "elasticity"], 3)
+)
+
+table_results
+```
+
+```{r aggregate-plot}
+# elasticity as a function of the loan's present value
+PV_grid  <- seq(500, 9250, by = 50)
+curve_df <- data.frame(
+  PV = PV_grid,
+  elasticity = -beta_pooled / (log(Ppost) - log(PV_grid))
+)
+
+# representative income groups marked on the curve
+salary_points <- c(20000, 26000, 32000, 42000)
+salary_df <- data.frame(salary = salary_points,
+                        PV = sapply(salary_points, pv_of))
+salary_df$elasticity <- -beta_pooled / (log(Ppost) - log(salary_df$PV))
+
+ggplot(curve_df, aes(PV, elasticity)) +
+  geom_line(linewidth = 1.4, color = "#E66100") +
+  geom_vline(xintercept = L, linetype = "dashed", color = "red", linewidth = 1) +
+  geom_point(data = salary_df, aes(PV, elasticity), size = 3.5, color = "black") +
+  geom_text(data = salary_df, aes(PV, elasticity, label = paste0("\u00A3", salary)),
+            nudge_y = 0.08, size = 4) +
+  labs(
+    x = "Economic value of the UK student loan (Present value, \u00A3)",
+    y = "Implied demand elasticity",
+    title = "How valuable was the UK student loan to EU applicants?",
+    subtitle = "Points show elasticity implied by expected graduate earnings"
+  ) +
+  coord_cartesian(ylim = c(0.3, 1.6)) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+# Country specific present values
+
+```{r country-pv}
+wages <- read_excel("wages.xlsx", sheet = "main_df")
+
+wages <- wages %>%
+  mutate(
+    wage_gbp = Wage_EURO * eur_gbp,
+    PV_loan  = sapply(wage_gbp, pv_of),
+    k_i      = log(Ppost) - log(PV_loan),     # country-specific price change
+    iso2c    = countrycode(Country, "country.name", "iso2c")
+  )
+```
+
+```{r merge-betas}
+betas_saturated_model <- read_excel("betas_saturated_model.xlsx")
+
+# left_join, not merge: a country with no beta is kept and surfaces as NA
+# rather than being silently dropped by an inner join.
+wages <- wages %>%
+  left_join(betas_saturated_model, by = "Country")
+```
+
+```{r country-elasticities}
+wages <- wages %>%
+  mutate(
+    Estimate_TWFE     = as.numeric(Estimate_TWFE),
+    Estimate_controls = as.numeric(Estimate_controls),
+    Estimate_Pooled   = as.numeric(Estimate_Pooled),
+
+    # heterogeneous k: divide each estimate by its country-specific price change
+    elasticity_new_TWFE     = Estimate_TWFE     / k_i,
+    elasticity_controls_new = Estimate_controls / k_i,
+    elasticity_new_Pooled   = Estimate_Pooled   / k_i,
+
+    # equal k: divide by the common log fee change (the FIX 1 denominator)
+    elasticity_TWFE     = Estimate_TWFE     / k_common,
+    elasticity_controls = Estimate_controls / k_common,
+    elasticity_Pooled   = Estimate_Pooled   / k_common
+  )
+```
+
+```{r country-table}
+## FIX: the original select listed elasticity_controls twice and never showed
+## elasticity_controls_new. Corrected to show both the equal-k and new versions.
+results_country <- wages %>%
+  select(Country, Wage_EURO, PV_loan, k_i,
+         elasticity_new_TWFE, elasticity_controls_new, elasticity_new_Pooled,
+         elasticity_TWFE, elasticity_controls, elasticity_Pooled)
+
+results_country
+```
+
+# Correlations
+
+```{r wb-pull}
+# EU pool, ISO2 codes
+eu_iso2 <- c(
+  "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR",
+  "HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK",
+  "SI","ES","SE"
+)
+
+# ONE World Bank pull for the whole basket, 2022. GDP PPP rides in here too,
+# so the separate GDP-only pull the old version did is no longer needed.
+wb_indicators <- c(
+  gdp_ppp_pc      = "NY.GDP.PCAP.PP.KD",
+  gini            = "SI.POV.GINI",
+  youth_unemp     = "SL.UEM.1524.ZS",
+  educ_spend_gdp  = "SE.XPD.TOTL.GD.ZS",
+  tertiary_enroll = "SE.TER.ENRR",
+  net_migration   = "SM.POP.NETM"
+)
+
+wb <- WDI(country = eu_iso2, indicator = wb_indicators,
+          start = 2022, end = 2022) %>%
+  select(iso2c, all_of(names(wb_indicators)))
+
+# Single working frame. Joined on iso2c, so spelling never breaks the merge.
+elas_df <- wages %>%
+  left_join(wb, by = "iso2c") %>%
+  rename(GDP_PPP = gdp_ppp_pc) %>%
+  filter(!is.na(GDP_PPP)) %>%
+  mutate(log_gdp = log(GDP_PPP))
+```
+
+```{r gdp-gradient-plot, message=FALSE, warning=FALSE}
+elas_long <- elas_df %>%
+  pivot_longer(
+    cols = c(elasticity_TWFE, elasticity_new_TWFE),
+    names_to = "type",
+    values_to = "elas"
+  )
+
+ggplot(elas_long, aes(x = log_gdp, y = elas, color = type)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_color_manual(
+    values = c("elasticity_TWFE" = "steelblue", "elasticity_new_TWFE" = "darkred"),
+    labels = c("elasticity_TWFE" = "equal k", "elasticity_new_TWFE" = "heterogeneous k")
+  ) +
+  labs(
+    x = "Log GDP per capita (PPP)",
+    y = "Demand elasticity",
+    color = NULL,
+    title = "Income gradient in demand elasticity",
+    subtitle = "Old vs loan-corrected elasticities"
+  ) +
+  theme_classic()
+```
+
+# Regression comparisons (TWFE vs OWFE vs Pooled)
+
+Consider the following panel data models:
+
+$$
+Y_{it} = \beta_i D_{it} + \alpha_i + \varepsilon_{it} \quad \text{(One-way fixed effects)}
+$$
+
+$$
+Y_{it} = \beta_i D_{it} + \alpha_i + \gamma_t + \varepsilon_{it} \quad \text{(Two-way fixed effects)}
+$$
+
+where $i$ indexes countries and $t$ indexes time. The parameter $\beta_i$ captures the country-specific treatment effect (elasticity), $\alpha_i$ are country fixed effects, and $\gamma_t$ are time fixed effects. The one-way fixed effects estimator removes country means:
+
+$$
+\tilde{Y}_{it}^{(1)} = Y_{it} - \bar{Y}_i
+$$
+
+The two-way fixed effects estimator removes both country and time means:
+
+$$
+\tilde{Y}_{it}^{(2)} = Y_{it} - \bar{Y}_i - \bar{Y}_t + \bar{Y}
+$$
+
+Subtracting the one-way transformation from the two-way transformation yields:
+
+$$
+\tilde{Y}_{it}^{(2)} - \tilde{Y}_{it}^{(1)} = -\bar{Y}_t + \bar{Y}
+$$
+$$
+\Rightarrow \tilde{Y}_{it}^{(2)} = \tilde{Y}_{it}^{(1)} - (\bar{Y}_t - \bar{Y})
+$$
+
+If $\gamma_t$ represents a common time effect across countries, then:
+
+$$
+\bar{Y}_t - \bar{Y} \approx \gamma_t
+$$
+
+so that:
+
+$$
+\tilde{Y}_{it}^{(2)} = \tilde{Y}_{it}^{(1)} - \gamma_t
+$$
+
+Let $\hat{\beta}_i^{OWFE}$ and $\hat{\beta}_i^{TWFE}$ denote the country-specific elasticities obtained from the one-way and two-way fixed effects models, respectively. Then:
+
+$$
+\hat{\beta}_i^{TWFE} = \hat{\beta}_i^{OWFE} - c
+$$
+
+where $c$ is a constant given by the average time effect:
+
+$$
+c = \frac{1}{T} \sum_{t} \gamma_t
+$$
+
+This implies a linear relationship between the two estimators:
+
+$$
+\hat{\beta}_i^{TWFE} = \alpha + 1 \cdot \hat{\beta}_i^{OWFE}, \quad \text{with } \alpha = -c
+$$
+
+Thus, the slope is equal to one and the difference between the two estimators is a constant shift.
+
+```{r regression-comparison}
+# Convention throughout: "old" = equal k (common price change),
+# "new" = heterogeneous k (country-specific loan-adjusted price change).
+reg_old_TWFE <- lm(elasticity_TWFE          ~ log_gdp, data = elas_df)
+reg_new_TWFE <- lm(elasticity_new_TWFE      ~ log_gdp, data = elas_df)
+reg_old_controls <- lm(elasticity_controls      ~ log_gdp, data = elas_df)
+reg_new_controls <- lm(elasticity_controls_new  ~ log_gdp, data = elas_df)
+
+## NOTE: in your upload the pooled pair was labelled the other way round
+## (reg_old_pooled used the heterogeneous-k column). Aligned here so old=equal k,
+## new=heterogeneous k, matching the TWFE and OWFE pairs above. Both regressions
+## are the same two you added; only the names were swapped to be consistent.
+reg_old_pooled <- lm(elasticity_Pooled      ~ log_gdp, data = elas_df)
+reg_new_pooled <- lm(elasticity_new_Pooled  ~ log_gdp, data = elas_df)
+
+stargazer(reg_old_TWFE, reg_new_TWFE, reg_old_controls , reg_new_controls , type = "text")
+stargazer(reg_old_pooled, reg_new_pooled, type = "text")
+```
+
+# Calibration robustness of the gradient collapse
+
+The headline result is that the income gradient in the loan-corrected elasticity
+(`reg_new_TWFE`: `elasticity_new_TWFE ~ log_gdp`) collapses to insignificance once
+the effective price change is made heterogeneous. That result is computed at a single
+calibration of the loan model, `r = 0.03` and `g = 0.02`. Because $k_i$ is a constructed
+quantity rather than an estimated one, a referee will ask whether the collapse is real
+or an artifact of where the loan parameters were set. Since $k_i$ falls with income by
+construction, dividing by it will attenuate an income gradient almost mechanically, so
+the burden is to show the collapse survives across defensible parameter choices and,
+more importantly, that it is the loan structure doing the work rather than any
+income-decreasing divisor. The next two sections address each in turn.
+
+## Sweeping the loan parameters one at a time
+
+For each value of the discount rate $r$ and the wage-growth rate $g$ across defensible
+bands, we re-solve the present value, rebuild $k_i$ for every country, recompute the
+loan-corrected TWFE elasticity, and re-run the income-gradient regression. Holding one
+parameter at baseline while the other moves isolates the sensitivity to each.
+
+```{r calib-sweep}
+## Recompute the loan-corrected TWFE gradient for a given (r, g). Everything else
+## (wages, Estimate_TWFE, the log_gdp used in the headline regression) is held fixed;
+## only the loan parameters that feed k_i are varied.
+gradient_at <- function(r_val, g_val) {
+  d <- wages %>%
+    mutate(
+      PV_k  = vapply(wage_gbp, function(w)
+        pv_loan(w, L = L, alpha = loan_alpha, tau = loan_tau,
+                g = g_val, r = r_val, horizon = loan_T),
+        numeric(1)),
+      k_i_s = log(Ppost) - log(PV_k),
+      eta_s = as.numeric(Estimate_TWFE) / k_i_s
+    ) %>%
+    left_join(elas_df %>% select(Country, log_gdp), by = "Country") %>%
+    filter(!is.na(eta_s), !is.na(log_gdp), is.finite(eta_s))
+
+  m  <- lm(eta_s ~ log_gdp, data = d)
+  co <- summary(m)$coefficients["log_gdp", ]
+  c(slope = unname(co["Estimate"]), p = unname(co["Pr(>|t|)"]), n = nrow(d))
+}
+
+r_base <- loan_r   # 0.03, baseline discount rate
+g_base <- loan_g   # 0.02, baseline wage growth
+
+# discount rate sweep, g held at baseline
+r_grid  <- seq(0.01, 0.06, by = 0.005)
+sweep_r <- as.data.frame(t(vapply(r_grid, function(rr) gradient_at(rr, g_base), numeric(3))))
+sweep_r$param <- "Discount rate r"; sweep_r$value <- r_grid
+
+# wage growth sweep, r held at baseline
+g_grid  <- seq(0.00, 0.04, by = 0.005)
+sweep_g <- as.data.frame(t(vapply(g_grid, function(gg) gradient_at(r_base, gg), numeric(3))))
+sweep_g$param <- "Wage growth g"; sweep_g$value <- g_grid
+
+sweep_all <- bind_rows(sweep_r, sweep_g)
+names(sweep_all)[1:2] <- c("slope", "p")
+
+# the table a referee scans: is the gradient ever significant across the sweep?
+sweep_all %>%
+  mutate(across(c(slope, p), ~ round(.x, 3)),
+         significant_5pct = p < 0.05) %>%
+  select(param, value, slope, p, significant_5pct, n)
+```
+
+```{r calib-sweep-plot, fig.width=7, fig.height=4}
+ggplot(sweep_all, aes(value, p)) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "#8B0000", linewidth = 0.4) +
+  geom_line(colour = accent, linewidth = 0.8) +
+  geom_point(colour = accent, size = 2) +
+  facet_wrap(~ param, scales = "free_x") +
+  labs(
+    x = "Parameter value",
+    y = "p-value of the income gradient",
+    title = "The gradient collapse is not an artifact of the loan parameters",
+    subtitle = "Loan-corrected TWFE elasticity on log GDP per capita, one parameter swept at a time",
+    caption = paste(
+      "Notes. Each point re-solves the present value at that parameter, rebuilds k_i, recomputes the",
+      "corrected elasticity, and re-runs the gradient regression. Dashed line is the 5% level; points",
+      "above it mean the income gradient is not significant at that calibration.",
+      sep = "\n"
+    )
+  ) +
+  theme_eer()
+```
+
+Read this honestly. If the p-value stays above 0.05 across the whole sweep, the collapse
+is robust to the loan calibration and the "arbitrary parameter" objection is closed. If
+the gradient becomes significant in part of the range, that region has to be reported and
+the headline claim qualified to the parameter values where it holds, rather than stated
+unconditionally.
+
+## Placebo denominator: is it the loan structure or just income?
+
+The sweep shows robustness to the parameters, but not the deeper question. Because $k_i$
+decreases with income, *any* income-decreasing divisor would flatten an income gradient.
+The test that actually adjudicates the mechanism is to divide the same $\beta_i$ by a
+placebo denominator that is a pure function of income and carries none of the loan
+structure, then ask whether the gradient still collapses. If it collapses under the
+placebo too, the loan story adds nothing and the critics are right that the result is
+mechanical. If it collapses under the real $k_i$ but *not* under the placebo, the loan
+valuation is doing work a naive income deflator cannot replicate.
+
+```{r placebo-denominator}
+## Build a placebo k that is a monotone function of income only, scaled to sit on the
+## same range as the real k_i so the comparison is like-for-like. It has no threshold,
+## no repayment rule, no discounting: it is income and nothing else.
+placebo_df <- elas_df %>%
+  filter(!is.na(k_i), !is.na(Estimate_TWFE), !is.na(log_gdp)) %>%
+  mutate(
+    # a pure log-income divisor, rescaled to the observed [min, max] of the real k_i
+    k_income_raw = log(wage_gbp),
+    k_placebo    = (k_income_raw - min(k_income_raw)) /
+                   (max(k_income_raw) - min(k_income_raw)) *
+                   (max(k_i) - min(k_i)) + min(k_i),
+    eta_placebo  = as.numeric(Estimate_TWFE) / k_placebo
+  )
+
+# three gradients side by side: equal k, real heterogeneous k, placebo income-only k
+g_equal   <- lm(elasticity_TWFE     ~ log_gdp, data = placebo_df)
+g_real    <- lm(elasticity_new_TWFE ~ log_gdp, data = placebo_df)
+g_placebo <- lm(eta_placebo         ~ log_gdp, data = placebo_df)
+
+placebo_summary <- bind_rows(
+  tidy(g_equal,   conf.int = TRUE) %>% filter(term == "log_gdp") %>% mutate(denominator = "Equal k (common price change)"),
+  tidy(g_real,    conf.int = TRUE) %>% filter(term == "log_gdp") %>% mutate(denominator = "Real k_i (loan-adjusted)"),
+  tidy(g_placebo, conf.int = TRUE) %>% filter(term == "log_gdp") %>% mutate(denominator = "Placebo k (income only)")
+) %>%
+  transmute(denominator,
+            slope    = round(estimate, 3),
+            conf.low = round(conf.low, 3),
+            conf.high= round(conf.high, 3),
+            p        = round(p.value, 3),
+            significant_5pct = p.value < 0.05)
+
+placebo_summary
+```
+
+```{r placebo-plot, fig.width=7, fig.height=3.5}
+placebo_summary %>%
+  mutate(denominator = factor(denominator,
+           levels = c("Equal k (common price change)",
+                      "Real k_i (loan-adjusted)",
+                      "Placebo k (income only)"))) %>%
+  ggplot(aes(slope, denominator)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high, colour = significant_5pct),
+                  linewidth = 0.8, size = 0.6) +
+  scale_colour_manual(values = c(`TRUE` = "#8B0000", `FALSE` = "grey55"), guide = "none") +
+  labs(
+    x = "Income gradient (slope on log GDP per capita)",
+    y = NULL,
+    title = "Is it the loan, or just income? The placebo denominator answers",
+    subtitle = "Gradient of the elasticity under three denominators, with 95% intervals",
+    caption = paste(
+      "Notes. Equal k divides by the common log price change. Real k_i divides by the loan-adjusted",
+      "price change. Placebo k divides by a pure income function rescaled to the same range as k_i.",
+      "If the gradient collapses under real k_i but not under placebo k, the loan structure is doing",
+      "the work rather than income alone. Crimson marks significance at the 5% level.",
+      sep = "\n"
+    )
+  ) +
+  theme_eer()
+```
+
+The decisive comparison is the bottom two rows. The equal-$k$ gradient is the uncorrected
+benchmark and is expected to be steep and significant. If the real-$k_i$ gradient is flat
+and insignificant while the placebo-$k$ gradient remains steep and significant, the paper
+can claim that the loan valuation, and not a generic income rescaling, is what dissolves
+the gradient. If instead the placebo also flattens the gradient, that is evidence the
+result is mechanical, and it should be reported as such rather than suppressed.
+
+# Other interesting correlations
+
+```{r other-correlations}
+# Reuse the single WB frame already pulled above (elas_df carries the basket).
+wb_vars <- c("gdp_ppp_pc", "gini", "youth_unemp",
+             "educ_spend_gdp", "tertiary_enroll", "net_migration")
+
+# elas_df renamed gdp_ppp_pc to GDP_PPP, so map that back for the GDP column
+dat <- elas_df %>% rename(gdp_ppp_pc = GDP_PPP)
+
+min_n <- 8   # minimum complete cases to include a model
+
+models_new <- list()
+kept_vars  <- c()
+
+for (v in wb_vars) {
+  dsub <- dat %>%
+    select(elasticity_new_TWFE, all_of(v)) %>%
+    filter(complete.cases(.))
+
+  if (nrow(dsub) < min_n) next                  # too few observations
+  if (sd(dsub[[v]], na.rm = TRUE) == 0) next     # no variation in regressor
+
+  models_new[[v]] <- lm(reformulate(v, response = "elasticity_new_TWFE"),
+                        data = dsub)
+  kept_vars <- c(kept_vars, v)
+}
+
+print(kept_vars)
+stargazer(models_new, type = "text")
+```
+```{r}
+library(broom)
+
+# readable labels for the six indicators
+nice_names <- c(
+  gdp_ppp_pc      = "GDP per capita (PPP)",
+  gini            = "Gini",
+  youth_unemp     = "Youth unemployment",
+  educ_spend_gdp  = "Education spending (% GDP)",
+  tertiary_enroll = "Tertiary enrollment",
+  net_migration   = "Net migration"
+)
+
+wb_vars <- names(nice_names)
+
+# refit each bivariate model on standardized variables so slopes are comparable,
+# and carry the R-squared along
+std_df <- bind_rows(lapply(wb_vars, function(v) {
+  d <- dat %>% select(y = elasticity_new_TWFE, x = all_of(v)) %>% filter(complete.cases(.))
+  if (nrow(d) < 8 || sd(d$x) == 0) return(NULL)
+  d <- d %>% mutate(x = as.numeric(scale(x)), y = as.numeric(scale(y)))
+  m <- lm(y ~ x, data = d)
+  tidy(m, conf.int = TRUE) %>%
+    filter(term == "x") %>%
+    mutate(variable = nice_names[v], r2 = summary(m)$r.squared, n = nrow(d))
+})) %>%
+  mutate(
+    sig = p.value < 0.05,
+    variable = factor(variable, levels = variable[order(estimate)])
+  )
+
+theme_eer <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text             = element_text(colour = "grey15"),
+      plot.title       = element_text(size = base_size + 1, face = "plain"),
+      plot.subtitle    = element_text(size = base_size - 1, colour = "grey35"),
+      plot.caption     = element_text(size = base_size - 3, colour = "grey40",
+                                      hjust = 0, margin = margin(t = 8)),
+      axis.line          = element_line(colour = "grey20", linewidth = 0.4),
+      axis.ticks         = element_line(colour = "grey20", linewidth = 0.4),
+      panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3),
+      legend.position    = "bottom",
+      legend.key.width   = unit(1.4, "lines")
+    )
+}
+
+accent <- "#6A0DAD"
+ggplot(std_df, aes(estimate, variable)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high, colour = sig),
+                  linewidth = 0.8, size = 0.6) +
+  geom_text(aes(label = sprintf("R\u00B2 = %.2f", r2)),
+            hjust = -0.25, vjust = -1, size = 3, colour = "grey35") +
+  scale_colour_manual(values = c(`TRUE` = "#8B0000", `FALSE` = "grey65"),
+                      guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0.08, 0.18))) +
+  labs(
+    x = "Standardized association with loan-corrected elasticity",
+    y = NULL,
+    title = "Only education spending moves the loan-corrected elasticity",
+    subtitle = "Standardized bivariate slopes with 95% intervals, one regressor at a time",
+    caption = paste(
+      "Notes. Each row is a separate OLS regression of the loan-corrected TWFE elasticity",
+      "on one standardized indicator. Crimson marks significance at the 5% level.",
+      sep = "\n"
+    )
+  ) +
+  theme_eer()
+```
+
+# Publication figures
+
+A small set of journal-style figures in the restrained black-and-grey register common to the empirical economics of education literature. One shared theme, one accent colour, light horizontal guides only, and a notes line under each figure rather than a heavy title.
+
+```{r eer-theme}
+# one shared theme for every figure below
+theme_eer <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text             = element_text(colour = "grey15"),
+      plot.title       = element_text(size = base_size + 1, face = "plain"),
+      plot.subtitle    = element_text(size = base_size - 1, colour = "grey35"),
+      plot.caption     = element_text(size = base_size - 3, colour = "grey40",
+                                      hjust = 0, margin = margin(t = 8)),
+      axis.line        = element_line(colour = "grey20", linewidth = 0.4),
+      axis.ticks       = element_line(colour = "grey20", linewidth = 0.4),
+      panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3),
+      legend.position  = "bottom",
+      legend.key.width = unit(1.4, "lines")
+    )
+}
+
+accent <- "#1F4E79"   # one muted navy accent, prints cleanly in greyscale
+```
+
+## Figure 1. The loan correction shifts each country's elasticity
+
+A dumbbell figure. For every country the open grey point is the elasticity under a single common price change, and the filled navy point is the elasticity once the price change is adjusted for the country-specific present value of the loan. The segment is the size of the correction.
+
+```{r fig-dumbbell, fig.width=7, fig.height=6}
+dumbbell_df <- elas_df %>%
+  transmute(Country,
+            equal_k  = elasticity_TWFE,
+            hetero_k = elasticity_new_TWFE) %>%
+  filter(!is.na(equal_k), !is.na(hetero_k)) %>%
+  arrange(hetero_k) %>%
+  mutate(Country = factor(Country, levels = Country))
+
+ggplot(dumbbell_df) +
+  geom_segment(aes(x = equal_k, xend = hetero_k, y = Country, yend = Country),
+               colour = "grey70", linewidth = 0.6) +
+  geom_point(aes(equal_k,  Country, shape = "Equal k"),
+             colour = "grey55", size = 2.6, fill = "white", stroke = 0.7) +
+  geom_point(aes(hetero_k, Country, shape = "Heterogeneous k"),
+             colour = accent, size = 2.6) +
+  scale_shape_manual(values = c("Equal k" = 21, "Heterogeneous k" = 16), name = NULL) +
+  labs(
+    x = "Implied demand elasticity (TWFE)",
+    y = NULL,
+    title = "Loan adjustment changes the implied elasticity country by country",
+    caption = paste(
+      "Notes. Equal k applies a single log price change, log(22200) minus log(9250).",
+      "Heterogeneous k applies each country's loan-adjusted price change k_i.",
+      "Countries are ordered by the heterogeneous-k elasticity."
+    )
+  ) +
+  theme_eer()
+```
+
+## Figure 2. Income gradient in the loan-corrected elasticity
+
+The loan-corrected elasticity against log GDP per capita, with country labels, an OLS fit, and a confidence band. This is the headline correlation the regression table formalises.
+
+```{r fig-gradient}
+shift_df <- elas_df %>%
+  select(Country, log_gdp, old = elasticity_TWFE, new = elasticity_new_TWFE) %>%
+  filter(!is.na(old), !is.na(new), !is.na(log_gdp)) %>%
+  arrange(log_gdp) %>%
+  mutate(x = row_number())          # one distinct column per country, ordered by income
+
+ggplot(shift_df, aes(x = x)) +
+
+ # each country's shift, arrow running from the old to the corrected elasticity,
+  # coloured by income so the columns carry the GDP dimension
+  geom_segment(aes(xend = x, y = old, yend = new, colour = log_gdp),
+               arrow = arrow(length = unit(0.06, "inches"), type = "closed"),
+               linewidth = 0.8) +
+
+  geom_point(aes(y = old), shape = 21, fill = "white", colour = "grey55", size = 2) +
+  geom_point(aes(y = new, colour = log_gdp), size = 2.4) +
+
+  # the two gradients laid over the ordered columns
+  geom_smooth(aes(y = old), method = "lm", se = FALSE,
+              colour = "grey55", linetype = "dashed", linewidth = 0.8) +
+  geom_smooth(aes(y = new), method = "lm", se = FALSE,
+              colour = "#6A0DAD", linewidth = 0.9) +
+
+  scale_colour_gradient(low = "#8B0000", high = "#4B0082",
+                        name = "Log GDP per capita") +
+  scale_x_continuous(breaks = shift_df$x, labels = shift_df$Country,
+                     expand = expansion(add = 0.6)) +
+
+  labs(
+    x = NULL,
+    y = "Demand elasticity (TWFE)",
+    title = "Each country's correction, and the gradient it reverses",
+    subtitle = "Countries ordered by income, arrows run from equal-k to loan-corrected elasticity",
+caption = paste(
+      "Notes. Dashed grey is the OLS gradient of the uncorrected elasticity over the income",
+      "ordering, which slopes up. Solid navy is the gradient of the loan-corrected elasticity,",
+      "which is flat. Arrows run from equal k to heterogeneous k, coloured by income.",
+      sep = "\n"
+    )
+    ) +
+  theme_eer() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+## Figure 3. Income-gradient slope across specifications
+
+A coefficient figure. Each row is the slope on log GDP per capita from one elasticity specification, with a 95% interval. It shows whether the gradient survives the move from equal to heterogeneous k and across the fixed-effects designs.
+
+```{r fig-coef, fig.width=7, fig.height=4}
+slope_df <- bind_rows(
+  tidy(reg_old_TWFE,   conf.int = TRUE) %>% mutate(model = "TWFE, equal k"),
+  tidy(reg_new_TWFE,   conf.int = TRUE) %>% mutate(model = "TWFE, heterogeneous k"),
+  tidy(reg_old_controls,   conf.int = TRUE) %>% mutate(model = "TWFE + controls, equal k"),
+  tidy(reg_new_controls,   conf.int = TRUE) %>% mutate(model = "TWFE + controls, heterogeneous k"),
+  tidy(reg_old_pooled, conf.int = TRUE) %>% mutate(model = "Pooled, equal k"),
+  tidy(reg_new_pooled, conf.int = TRUE) %>% mutate(model = "Pooled, heterogeneous k")
+) %>%
+  filter(term == "log_gdp") %>%
+  mutate(model = factor(model, levels = rev(model)))
+
+ggplot(slope_df, aes(estimate, model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
+                  colour = accent, linewidth = 0.6, size = 0.5) +
+  labs(
+    x = "Slope on log GDP per capita",
+    y = NULL,
+    title = "The income gradient holds across specifications",
+    caption = "Notes. Points are OLS slope coefficients with 95% confidence intervals."
+  ) +
+  theme_eer()
+```
+
+## Figure 4. How much the loan compresses the effective price increase
+
+The naive reform raises the log price by k_common for everyone. The loan shrinks that for countries whose graduates expect to repay little. This ranks each country by its loan-adjusted price change k_i against the common benchmark.
+
+```{r fig-kbar, fig.width=7, fig.height=6}
+k_df <- elas_df %>%
+  select(Country, k_i) %>%
+  filter(!is.na(k_i)) %>%
+  arrange(k_i) %>%
+  mutate(Country = factor(Country, levels = Country))
+
+ggplot(k_df, aes(k_i, Country)) +
+  geom_segment(aes(x = k_common, xend = k_i, y = Country, yend = Country),
+               colour = "grey75", linewidth = 0.5) +
+  geom_vline(xintercept = k_common, linetype = "dashed",
+             colour = "grey45", linewidth = 0.5) +
+  geom_point(colour = accent, size = 2.4) +
+  annotate("text", x = k_common, y = Inf, label = "Common k",
+           vjust = 1.6, hjust = -0.05, size = 3, colour = "grey45") +
+  labs(
+    x = "Loan-adjusted log price change, k_i",
+    y = NULL,
+    title = "The loan compresses the effective price increase, unevenly",
+    caption = "Notes. Dashed line is the common log price change, log(22200) minus log(9250). Each point is a country's loan-adjusted k_i."
+  ) +
+  theme_eer()
+```

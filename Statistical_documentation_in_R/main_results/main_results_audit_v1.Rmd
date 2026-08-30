@@ -529,6 +529,10 @@ ggplot(decomp_plot, aes(y = country)) +
   )
 ```
 
+
+
+
+
 ## Descriptive initial and later post-reform effects
 
 The period-split design needs a different `Post` window, so it gets its own frame without overwriting the baseline variable. `Post` flags 2021–2023 and `Post_COVID` flags 2024–2025. These are descriptive initial and later post-reform effects. The split does not separately identify a causal COVID component.
@@ -1148,8 +1152,8 @@ panel_wb <- panel_wb %>%
 
 ```{r}
 # Quick inspection of the data in Excel
-library(openxlsx)
-write.xlsx(panel_wb, "panel_wb.xlsx", overwrite = TRUE)
+#library(openxlsx)
+#write.xlsx(panel_wb, "panel_wb.xlsx", overwrite = TRUE)
 ```
 
 Centre the three controls once. Centring is done on the log (for GDP and population), so models must reference the bare `c_*` variables and never wrap `log()` around them again.
@@ -1206,13 +1210,6 @@ modelsummary(
 )
 ```
 
-```{r}
-wald(m6, c("did:c_log_GDPpc", "did:c_log_Pop15_64", "did:c_YouthUnempl"))
-```
-
-The two-way fixed-effects estimates indicate a large contraction in EU applications following the 2021 fee reform. The baseline specification places the effect at -1.109, and the fully controlled additive model (M5) estimates -0.961. Translated into levels, the latter corresponds to a decline of approximately 62%. The stability of the estimate after adding the controls is evidence against those observed covariates explaining the baseline result.
-
-The fully interacted specification (M6) allows the treatment effect to vary with these structural characteristics. In the manuscript table, its ATT is -1.211 and the interactions with GDP per capita, working-age population, and youth unemployment are 0.808, 0.100, and 0.011. The first two are positive and precisely estimated, while the youth-unemployment interaction is not statistically distinguishable from zero. These are conditional associations and should not be read as separate causal mechanisms.
 
 ## Saturated controls (S1–S4)
 
@@ -1224,10 +1221,12 @@ panel_wb_sat <- panel_wb %>%
     ))
   ) %>%
   filter(!is.na(log_app), !is.na(Post), !is.na(treated_factor))
+
 ```
 
 ```{r}
 # S1: saturated DiD only
+
 s1 <- feols(
   log_app ~ i(treated_factor, Post, ref = "CONTROL") | Domicile_named_country + Year,
   data = panel_wb_sat, panel.id = ~ Domicile_named_country + Year,
@@ -1257,6 +1256,7 @@ s4 <- feols(
   vcov = DK(1), weights = ~ regression_weight
 )
 
+
 modelsummary(
   list(
     "S1 Saturated DiD" = s1,
@@ -1271,6 +1271,40 @@ modelsummary(
 ```{r}
 #summary(s4)
 ```
+
+
+# <<<PLM weights incorrectly>>>
+
+
+This block is essentially included to demonstrate how PLM weights the regressions incorrectly (or perhaps not in the way intended for how it is supposed to be weighting).
+
+
+```{r}
+m1 <- plm(
+  log_app ~ did * (c_log_GDPpc + c_log_Pop15_64 + c_YouthUnempl),
+  data = panel_wb,
+  effect = "twoways",
+  model = "within",
+  index = c("Domicile_named_country", "Year")
+)
+
+m2 <- lm(
+  log_app ~ did * (c_log_GDPpc + c_log_Pop15_64 + c_YouthUnempl) +
+    factor(Year) + factor(Domicile_named_country),
+  data = panel_wb
+)
+
+m3 <- feols(
+  log_app ~ did * (c_log_GDPpc + c_log_Pop15_64 + c_YouthUnempl) |
+    Domicile_named_country + Year,
+  data = panel_wb
+)
+
+m1
+m2
+m3
+```
+
 
 
 ## Plot saturated effects {#sec-plot-saturated-effects}
